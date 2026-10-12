@@ -76,7 +76,7 @@ class Settings(BaseSettings):
 
     elevenlabs_api_key: SecretStr | None = None
     elevenlabs_music_base_url: str = "https://api.elevenlabs.io"
-    elevenlabs_music_model_id: str = "music_v2"
+    elevenlabs_music_model_id: str = "music_v2_5"
     elevenlabs_music_output_format: str = "pcm_44100"
     elevenlabs_clear_chinese_vocal_mode: bool = True
     elevenlabs_force_instrumental: bool = False
