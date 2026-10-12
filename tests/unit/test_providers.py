@@ -165,6 +165,7 @@ async def test_elevenlabs_sends_complete_prompt_and_streams_audio(tmp_path: Path
     assert requests[0].url.path == "/v1/music/stream"
     assert requests[0].url.params["output_format"] == "pcm_8000"
     music_body = json.loads(requests[0].content)
+    assert music_body["model_id"] == "music_v2_5"
     assert "[Genre: Rock]" in music_body["prompt"]
     assert "第一句原歌词\n第二句原歌词" in music_body["prompt"]
     assert "Mandarin Chinese lead vocals" in music_body["prompt"]
@@ -272,6 +273,7 @@ async def test_elevenlabs_rejected_stream_falls_back_once_to_compose(
         )
     assert [request.url.path for request in requests] == ["/v1/music/stream", "/v1/music"]
     assert requests[0].content == requests[1].content
+    assert json.loads(requests[1].content)["model_id"] == "music_v2_5"
     assert requests[0].url.params == requests[1].url.params
     assert requests[0].headers["xi-api-key"] == requests[1].headers["xi-api-key"]
     assert result.debug["endpoint"].endswith("/v1/music")

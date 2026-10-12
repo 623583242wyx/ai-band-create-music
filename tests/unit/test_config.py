@@ -18,6 +18,7 @@ def test_default_port_and_prompt_limit(tmp_path: Path) -> None:
     assert settings.task_backend == "inline"
     assert settings.cache_backend == "none"
     assert settings.music_provider == "minimax_music"
+    assert settings.elevenlabs_music_model_id == "music_v2_5"
 
 
 def test_minimax_music_defaults_and_provider(tmp_path: Path) -> None:
