@@ -45,7 +45,8 @@ STYLE_TAG_REQUIREMENTS = "\n".join(
         "标签值应包含可听见、可执行的细节，例如 BPM、律动、音色、中文人声唱法、"
         "段落推进、空间效果、动态变化和需要避免的声音。",
         "每个原始标签值不超过 200 个字符；需要合并时仍须保持信息完整。",
-        "保留用户的显式要求，为未指定项补充协调一致的专业选择；不得引用具体艺人或受版权保护作品。",
+        "严格遵守用户提供的风格要求，不得替换或违背；"
+        "为未指定项补充协调一致的专业选择；不得引用具体艺人或受版权保护作品。",
         "Negative Constraints 禁止出现 no lyrics、no vocals 或 no melody。",
     ]
 )
@@ -136,7 +137,9 @@ def split_generation_prompt(user_prompt: str) -> tuple[str, str]:
     style_marker = "[风格要求]"
     if prompt.startswith(lyrics_marker):
         parts = re.split(
-            r"(?:\r\n|\n|\r)\[风格要求\](?:\r\n|\n|\r)", prompt[len(lyrics_marker) :], maxsplit=1
+            r"(?:\r\n|\n|\r)\[风格要求\](?:\r\n|\n|\r|$)",
+            prompt[len(lyrics_marker) :],
+            maxsplit=1,
         )
         return parts[0].strip(), parts[1].strip() if len(parts) > 1 else ""
     if prompt.startswith(style_marker):
@@ -417,8 +420,14 @@ class OpenAICompatiblePromptExpander:
         generate_lyrics = not lyrics
         if generate_lyrics:
             request_content = f"创作要求：\n{style or user_prompt}"
+        elif not style:
+            request_content = (
+                f"歌词：\n{lyrics}\n\n"
+                "风格要求为空，请根据歌词的主题、情绪、意象和语言节奏推断适合的音乐风格，"
+                "并生成完整的 styleTags；必须保留原歌词，只能添加段落标签。"
+            )
         else:
-            request_content = f"歌词：\n{lyrics}\n\n风格要求：\n{style or '请补充协调的音乐风格'}"
+            request_content = f"歌词：\n{lyrics}\n\n风格要求：\n{style}"
         request_body: dict[str, object] = {
             "model": self._settings.llm_model,
             "temperature": 0,
