@@ -237,6 +237,45 @@ def test_create_prompt_splits_crlf_lyrics_from_style() -> None:
     assert style == "梦幻流行"
 
 
+@pytest.mark.parametrize("ending", ["", "\n\n[风格要求]\n", "\r\n\r\n[风格要求]\r\n \t"])
+def test_create_prompt_splits_lyrics_with_empty_style(ending: str) -> None:
+    assert split_generation_prompt(f"[歌词与创作内容]\n第一句\n第二句{ending}") == (
+        "第一句\n第二句",
+        "",
+    )
+
+
+@pytest.mark.parametrize("ending", ["", "\n\n[风格要求]\n \t"])
+async def test_prepare_infers_style_from_lyrics_when_style_is_empty(
+    tmp_path: Path, ending: str
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        content = json.dumps(
+            {
+                "taggedLyrics": "[Verse]\n第一句\n[Chorus]\n第二句",
+                "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+            }
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
+            f"[歌词与创作内容]\n第一句\n第二句{ending}"
+        )
+
+    assert prepared.lyrics == "[verse]\n第一句\n[chorus]\n第二句"
+    assert prepared.structured_prompt == EXPANDED_MANDARIN_ROCK_PROMPT
+    assert len(requests) == 1
+    messages = json.loads(requests[0].content)["messages"]
+    assert "不得增加、删除、改写、重排或重复任何歌词" in messages[0]["content"]
+    assert "歌词：\n第一句\n第二句\n\n" in messages[1]["content"]
+    assert "根据歌词的主题、情绪、意象和语言节奏推断" in messages[1]["content"]
+
+
 async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
@@ -283,6 +322,8 @@ async def test_prepare_tags_lyrics_and_expands_style_in_one_request(tmp_path: Pa
     assert body["thinking"] == {"type": "disabled"}
     assert body["response_format"] == {"type": "json_object"}
     assert "限 2-10 个汉字" in body["messages"][0]["content"]
+    assert "严格遵守用户提供的风格要求，不得替换或违背" in body["messages"][0]["content"]
+    assert body["messages"][1]["content"] == "歌词：\n第一句\n第二句\n\n风格要求：\n普通话摇滚"
 
 
 async def test_prepare_keeps_supplied_title_without_requesting_another(tmp_path: Path) -> None:
@@ -449,7 +490,12 @@ async def test_prepare_enables_json_mode_for_official_openai(tmp_path: Path) -> 
     assert "目标时长" not in body["messages"][1]["content"]
 
 
-async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "user_prompt", ["[风格要求]\n男声、摇滚", "[歌词与创作内容]\n\n[风格要求]\n男声、摇滚"]
+)
+async def test_prepare_generates_lyrics_and_style_for_auto_duration(
+    tmp_path: Path, user_prompt: str
+) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -481,7 +527,7 @@ async def test_prepare_generates_lyrics_and_style_for_auto_duration(tmp_path: Pa
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
-            "[风格要求]\n男声、摇滚",
+            user_prompt,
             None,
             job_id="prompt-job",
         )
@@ -737,6 +783,7 @@ async def test_prepare_retries_generated_lyrics_over_character_budget(tmp_path: 
     assert "模型生成的歌词正文超过 1000 个字符" in retry_body["messages"][-1]["content"]
 
 
+@pytest.mark.parametrize("style", ["摇滚", ""])
 @pytest.mark.parametrize(
     "original",
     [
@@ -745,7 +792,7 @@ async def test_prepare_retries_generated_lyrics_over_character_budget(tmp_path: 
     ],
 )
 async def test_prepare_preserves_original_lyrics_when_model_rewrites_them(
-    tmp_path: Path, original: str
+    tmp_path: Path, original: str, style: str
 ) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
@@ -770,7 +817,7 @@ async def test_prepare_preserves_original_lyrics_when_model_rewrites_them(
     settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
-            f"[歌词与创作内容]\n{original}\n\n[风格要求]\n摇滚"
+            f"[歌词与创作内容]\n{original}\n\n[风格要求]\n{style}"
         )
 
     expected = (
