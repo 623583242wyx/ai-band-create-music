@@ -11,6 +11,7 @@ from pydantic import (
     model_validator,
 )
 
+from app.services.references import REFERENCE_ID_PATTERN
 from app.services.stems import is_vocal_stem
 
 
@@ -75,6 +76,8 @@ class GenerateRequest(BaseModel):
     title: str | None = Field(default=None, max_length=100)
     provider: Literal["minimax_music", "elevenlabs_music"] | None = None
     count: Literal[1, 2] = 1
+    # ID returned by POST /api/references; ElevenLabs only.
+    referenceId: str | None = Field(default=None, pattern=REFERENCE_ID_PATTERN)
 
     @field_validator("title")
     @classmethod

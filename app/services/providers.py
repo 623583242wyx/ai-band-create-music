@@ -41,6 +41,9 @@ ELEVENLABS_AUTO_MIN_DURATION_SECONDS = 3
 # Live /v1/music/stream check (2026-09-29), music_v2, output_format=pcm_44100:
 # music_length_ms=3000, force_instrumental=true, short piano prompt; HTTP 200,
 # 529,200 bytes in 408 chunks; wrapped WAV: 44,100 Hz, 16-bit stereo, 3.000s.
+# Audio reference / conditioning_ref is documented for these models only:
+# https://elevenlabs.io/docs/overview/capabilities/music (Audio Reference)
+ELEVENLABS_REFERENCE_MODELS = frozenset({"music_v2", "music_v2_5"})
 ELEVENLABS_PCM_CHANNELS = 2
 ELEVENLABS_PCM_SAMPLE_WIDTH = 2
 LYRIC_BREAK_PATTERN = re.compile(r"(?<=[，。！？；、,.!?;:：])")
@@ -88,6 +91,15 @@ def _audio_target(
             f"full_song_{job_id}_{variation + 1}{suffix}"
         )
     return settings.output_dir / fallback_name
+
+
+@dataclass(frozen=True, slots=True)
+class AudioReference:
+    """An uploaded ElevenLabs song used as conditioning_ref for the first plan chunk."""
+
+    song_id: str
+    duration_ms: int
+    strength: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,6 +369,93 @@ class ElevenLabsMusicProvider:
     def _headers(self) -> dict[str, str]:
         return {"xi-api-key": self._api_key(), "Content-Type": "application/json"}
 
+    async def upload_reference(self, path: Path, filename: str) -> str:
+        """Upload a prepared clip and return its song_id (billed like one generation)."""
+        url = f"{self._settings.elevenlabs_music_base_url}/v1/music/upload"
+        try:
+            with path.open("rb") as audio:
+                response = await self._client.post(
+                    url,
+                    files={"file": (filename, audio, "audio/mpeg")},
+                    headers={"xi-api-key": self._api_key()},
+                    timeout=self._settings.music_api_timeout_seconds,
+                )
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPStatusError as exc:
+            error_type = (
+                ProviderGlobalError
+                if exc.response.status_code in GLOBAL_PROVIDER_HTTP_STATUSES
+                else GenerationError
+            )
+            raise error_type(
+                self._failure_message(exc).replace("音乐生成失败", "参考音频上传失败")
+            ) from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise GenerationError(
+                f"ElevenLabs 参考音频上传失败：{_http_failure_message(exc)}"
+            ) from exc
+        song_id = data.get("song_id") if isinstance(data, dict) else None
+        if not isinstance(song_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", song_id):
+            raise GenerationError("ElevenLabs 参考音频上传失败：接口未返回有效的 song_id。")
+        return song_id
+
+    async def _reference_plan(
+        self,
+        prompt: str,
+        duration_seconds: int | None,
+        reference: AudioReference,
+        job_id: str | None,
+        variation: int,
+    ) -> tuple[dict[str, Any], float]:
+        """Build a free composition plan from the prompt and condition its first chunk.
+
+        conditioning_ref only exists on composition-plan chunks, which cannot be combined with
+        `prompt`; /v1/music/plan turns the same prompt into chunks without spending credits.
+        """
+        url = f"{self._settings.elevenlabs_music_base_url}/v1/music/plan"
+        body: dict[str, Any] = {
+            "prompt": prompt,
+            "model_id": self._settings.elevenlabs_music_model_id,
+        }
+        if duration_seconds is not None:
+            body["music_length_ms"] = duration_seconds * 1000
+        response = await self._client.post(
+            url,
+            json=body,
+            headers=self._headers(),
+            timeout=self._settings.music_api_timeout_seconds,
+        )
+        update_provider_diagnostic(
+            self._settings.output_dir,
+            job_id,
+            variation,
+            planRequest={"method": "POST", "url": url, "body": body},
+            planResponse=_response_diagnostic(response),
+        )
+        response.raise_for_status()
+        plan = response.json()
+        chunks = plan.get("chunks") if isinstance(plan, dict) else None
+        if (
+            not isinstance(chunks, list)
+            or not chunks
+            or not all(isinstance(chunk, dict) for chunk in chunks)
+            or "text" not in chunks[0]
+        ):
+            raise GenerationError("ElevenLabs 音乐生成失败：composition plan 响应结构无效。")
+        durations = [chunk.get("duration_ms") for chunk in chunks]
+        if not all(type(value) is int and value > 0 for value in durations):
+            raise GenerationError("ElevenLabs 音乐生成失败：composition plan 缺少有效的段落时长。")
+        chunks[0] = {
+            **chunks[0],
+            "conditioning_ref": {
+                "song_id": reference.song_id,
+                "range": {"start_ms": 0, "end_ms": reference.duration_ms},
+            },
+            "condition_strength": reference.strength,
+        }
+        return {**plan, "chunks": chunks}, sum(durations) / 1000
+
     async def generate(
         self,
         structured_prompt: str,
@@ -366,10 +465,22 @@ class ElevenLabsMusicProvider:
         variation: int = 0,
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
+        reference: AudioReference | None = None,
     ) -> MusicResult:
         if duration_seconds is not None and duration_seconds <= 0:
             raise GenerationError("ElevenLabs 音乐生成失败：目标时长必须大于 0 秒。")
         force_instrumental = self._settings.elevenlabs_force_instrumental
+        if reference is not None:
+            if force_instrumental:
+                raise GenerationError(
+                    "ElevenLabs 音乐生成失败：音频参考需要 composition plan，"
+                    "不能与 ELEVENLABS_FORCE_INSTRUMENTAL=true 同时使用。"
+                )
+            if self._settings.elevenlabs_music_model_id not in ELEVENLABS_REFERENCE_MODELS:
+                raise GenerationError(
+                    "ElevenLabs 音乐生成失败：音频参考仅支持 music_v2 / music_v2_5，"
+                    f"当前 ELEVENLABS_MUSIC_MODEL_ID={self._settings.elevenlabs_music_model_id}。"
+                )
         clear_chinese = (
             self._settings.elevenlabs_clear_chinese_vocal_mode and not force_instrumental
         )
@@ -418,6 +529,29 @@ class ElevenLabsMusicProvider:
                 )
                 raise GenerationError(message)
 
+            expected_seconds: float | None = duration_seconds
+            if reference is not None:
+                plan, expected_seconds = await self._reference_plan(
+                    prompt, duration_seconds, reference, job_id, variation
+                )
+                # composition_plan excludes prompt, music_length_ms and force_instrumental.
+                request_body = {
+                    "composition_plan": plan,
+                    "model_id": self._settings.elevenlabs_music_model_id,
+                }
+                request_diagnostic = {**request_diagnostic, "body": request_body}
+                update_provider_diagnostic(
+                    self._settings.output_dir,
+                    job_id,
+                    variation,
+                    request=request_diagnostic,
+                    audioReference={
+                        "songId": reference.song_id,
+                        "durationMs": reference.duration_ms,
+                        "strength": reference.strength,
+                    },
+                )
+
             target = _audio_target(
                 self._settings,
                 f"full_song_elevenlabs_{time.time_ns()}.wav",
@@ -425,7 +559,7 @@ class ElevenLabsMusicProvider:
                 variation,
             )
             await self._report_progress(
-                progress, "generating_music", expected_audio_seconds=duration_seconds
+                progress, "generating_music", expected_audio_seconds=expected_seconds
             )
             for attempt in range(2):
                 async with self._client.stream(
@@ -462,7 +596,7 @@ class ElevenLabsMusicProvider:
                         response.aiter_bytes(),
                         target,
                         sample_rate,
-                        duration_seconds,
+                        expected_seconds,
                         progress=progress,
                     )
                     break
@@ -478,6 +612,11 @@ class ElevenLabsMusicProvider:
                     "endpoint": url,
                     "clearChineseVocalMode": clear_chinese,
                     "durationSeconds": actual_duration_seconds,
+                    **(
+                        {"audioReferenceId": reference.song_id, "mode": "reference_plan_pcm_wav"}
+                        if reference is not None
+                        else {}
+                    ),
                 },
             )
         except GenerationError:
@@ -520,7 +659,7 @@ class ElevenLabsMusicProvider:
         chunks: AsyncIterator[bytes],
         target: Path,
         sample_rate: int,
-        expected_duration_seconds: int | None,
+        expected_duration_seconds: float | None,
         *,
         progress: ProviderProgressCallback | None = None,
     ) -> float:
@@ -588,7 +727,8 @@ class ElevenLabsMusicProvider:
             ):
                 raise GenerationError(
                     "ElevenLabs 音乐生成接口返回的 PCM 时长异常："
-                    f"期望 {expected_duration_seconds} 秒，实际 {actual_duration_seconds:.3f} 秒。"
+                    f"期望 {expected_duration_seconds:g} 秒，"
+                    f"实际 {actual_duration_seconds:.3f} 秒。"
                 )
             temporary.replace(target)
             if written != last_reported_bytes:

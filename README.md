@@ -56,6 +56,25 @@ ElevenLabs 直接接收完整的结构化歌词和扩充风格标签，由模型
 `ELEVENLABS_FORCE_INSTRUMENTAL=true` 时会自动关闭 ElevenLabs 中文人声要求，避免与纯音乐
 模式冲突。
 
+### ElevenLabs 音频参考
+
+`POST /api/references`（multipart 字段 `file`）上传一段参考音频，用来引导新歌的整体音色、
+制作风格、配器、速度与情绪（不会复制或混音原曲）。仅支持 `music_v2` / `music_v2_5`，
+且不能与 `ELEVENLABS_FORCE_INSTRUMENTAL=true` 同时使用；MiniMax 不支持。
+
+- 后端先用 ffmpeg 截取前 30 秒（ElevenLabs 文档规定 conditioning 参考最长 30,000 ms）并转成
+  MP3，再调用 `POST /v1/music/upload`。**上传按一次歌曲生成计费**，被检测为版权内容时仍收一半
+  费用，所以每个文件只上传一次，`song_id` 记录在 `output/references/index.json`，之后直接复用。
+- `GET /api/references` 列出已上传参考（含 `output/references/*.mp3` 试听地址），
+  `DELETE /api/references/<id>` 只删除本地记录与试听文件（ElevenLabs 没有公开的删除接口）。
+- 生成请求（`/api/generate`、`/api/jobs`）带 `referenceId` 时，后端先调用免费的
+  `POST /v1/music/plan` 把同一份 Prompt 转成 composition plan，再在第一个 chunk 上加
+  `conditioning_ref`（参考的 0–N 毫秒）与 `condition_strength`
+  （`ELEVENLABS_REFERENCE_CONDITION_STRENGTH`，默认 `medium`；实测 `high` 会过于贴近参考），然后以 `composition_plan`
+  调用 stream 接口。此时不发送 `prompt` / `music_length_ms` / `force_instrumental`
+  （接口规定它们不能与 composition plan 同时使用），目标时长交给 plan 接口。
+- 单文件上限 `ELEVENLABS_REFERENCE_MAX_UPLOAD_MB`（默认 30 MB），参考至少 3 秒。
+
 自部署 MiniMax Music 3 使用兼容的 `/v1/audio/jobs` 接口：
 
 ```env

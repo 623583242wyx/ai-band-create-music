@@ -17,12 +17,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, status
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
@@ -69,7 +69,24 @@ from app.services.job_files import (
 )
 from app.services.orchestrator import GenerationOrchestrator
 from app.services.prompt import OpenAICompatiblePromptExpander, split_generation_prompt
-from app.services.providers import create_music_provider
+from app.services.providers import (
+    ELEVENLABS_REFERENCE_MODELS,
+    AudioReference,
+    create_music_provider,
+)
+from app.services.references import (
+    REFERENCE_DIR,
+    REFERENCE_MAX_SECONDS,
+    ReferenceInputError,
+    clean_reference_name,
+    find_reference,
+    load_references,
+    new_reference_entry,
+    prepare_reference_audio,
+    reference_audio_name,
+    references_dir,
+    save_references,
+)
 from app.services.retention import (
     expires_at,
     is_expired,
@@ -110,16 +127,19 @@ _replacement_wind_down_active = 0
 
 
 class RequestSizeLimitMiddleware:
-    def __init__(self, app: ASGIApp, default_limit: int) -> None:
+    def __init__(
+        self, app: ASGIApp, default_limit: int, path_limits: dict[str, int] | None = None
+    ) -> None:
         self.app = app
         self.default_limit = default_limit
+        self.path_limits = path_limits or {}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        limit = self.default_limit
+        limit = self.path_limits.get(scope["path"], self.default_limit)
         content_length = Headers(scope=scope).get("content-length")
         if content_length is not None:
             try:
@@ -533,7 +553,13 @@ def create_app(
     application.add_middleware(
         RequestSizeLimitMiddleware,
         default_limit=application_settings.request_max_bytes,
+        # Multipart framing adds a little on top of the audio file itself.
+        path_limits={
+            "/api/references": application_settings.elevenlabs_reference_max_upload_bytes
+            + 1024 * 1024
+        },
     )
+    application.state.reference_lock = asyncio.Lock()
 
     @application.get("/api/health")
     async def health(request: Request) -> dict[str, object]:
@@ -560,6 +586,16 @@ def create_app(
                 "modelId": application_settings.elevenlabs_music_model_id,
                 "outputFormat": application_settings.elevenlabs_music_output_format,
                 "clearChineseVocalMode": application_settings.elevenlabs_clear_chinese_vocal_mode,
+                "audioReference": {
+                    "supported": application_settings.elevenlabs_music_model_id
+                    in ELEVENLABS_REFERENCE_MODELS
+                    and not application_settings.elevenlabs_force_instrumental,
+                    "maxSeconds": REFERENCE_MAX_SECONDS,
+                    "maxUploadMb": application_settings.elevenlabs_reference_max_upload_mb,
+                    "conditionStrength": (
+                        application_settings.elevenlabs_reference_condition_strength
+                    ),
+                },
             },
             "splitting": {
                 "enabled": True,
@@ -602,6 +638,7 @@ def create_app(
     async def generate(payload: GenerateRequest, request: Request):
         try:
             prompt, duration = _generation_parameters(payload, application_settings)
+            reference = _audio_reference(payload, application_settings)
         except ValueError as exc:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -660,6 +697,7 @@ def create_app(
                 provider=payload.provider,
                 count=payload.count,
                 title=job.title,
+                reference=reference,
             )
             job.result = result
             job.status, job.stage, job.progress = "succeeded", "completed", 100
@@ -720,6 +758,7 @@ def create_app(
     async def create_generation_job(payload: GenerateRequest, request: Request):
         try:
             prompt, duration = _generation_parameters(payload, application_settings)
+            reference = _audio_reference(payload, application_settings)
         except ValueError as exc:
             return JSONResponse(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -812,6 +851,7 @@ def create_app(
                     provider=payload.provider,
                     count=payload.count,
                     title=job.title,
+                    reference=reference,
                 )
                 job.status = "succeeded"
                 job.result["createdAt"] = job.created_at
@@ -840,6 +880,132 @@ def create_app(
 
         job.task = asyncio.create_task(execute(), name=job_id)
         return {"jobId": job_id, "status": job.status}
+
+    def _reference_response(entry: dict[str, Any], request: Request) -> dict[str, Any]:
+        audio = entry.get("audio")
+        return {
+            "id": entry["id"],
+            "name": entry.get("name") or "参考音频",
+            "durationSeconds": entry["durationSeconds"],
+            "createdAt": entry.get("createdAt"),
+            "audioUrl": build_public_audio_url(
+                _public_base_url(request, application_settings), f"{REFERENCE_DIR}/{audio}"
+            )
+            if isinstance(audio, str) and audio
+            else None,
+        }
+
+    @application.get("/api/references")
+    async def list_audio_references(request: Request):
+        return {
+            "references": [
+                _reference_response(entry, request)
+                for entry in load_references(application_settings.output_dir)
+            ],
+            "maxSeconds": REFERENCE_MAX_SECONDS,
+            "maxUploadMb": application_settings.elevenlabs_reference_max_upload_mb,
+        }
+
+    @application.post(
+        "/api/references",
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            400: {"model": ErrorResponse},
+            413: {"model": ErrorResponse},
+            502: {"model": ErrorResponse},
+            503: {"model": ErrorResponse},
+        },
+    )
+    async def upload_audio_reference(request: Request, file: Annotated[UploadFile, File()]):
+        def error(code: int, message: str) -> JSONResponse:
+            return JSONResponse(status_code=code, content={"success": False, "message": message})
+
+        provider = _orchestrator(request).music_providers.get("elevenlabs_music")
+        if application_settings.music_api_mode != "real" or not hasattr(
+            provider, "upload_reference"
+        ):
+            return error(503, "音频参考需要 MUSIC_API_MODE=real 并配置 ElevenLabs。")
+        if application_settings.elevenlabs_music_model_id not in ELEVENLABS_REFERENCE_MODELS:
+            return error(400, "音频参考仅支持 ElevenLabs music_v2 / music_v2_5 模型。")
+        name = clean_reference_name(file.filename)
+        directory = references_dir(application_settings.output_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        limit = application_settings.elevenlabs_reference_max_upload_bytes
+        descriptor, raw_name = tempfile.mkstemp(dir=directory, prefix=".upload.")
+        raw_path = Path(raw_name)
+        prepared = directory / reference_audio_name()
+        registered = False
+        try:
+            written = 0
+            with os.fdopen(descriptor, "wb") as raw:
+                while chunk := await file.read(1024 * 1024):
+                    written += len(chunk)
+                    if written > limit:
+                        return error(
+                            413,
+                            "参考音频不能超过 "
+                            f"{application_settings.elevenlabs_reference_max_upload_mb} MB。",
+                        )
+                    raw.write(chunk)
+            if written == 0:
+                return error(400, "上传的文件为空。")
+            try:
+                duration = await prepare_reference_audio(raw_path, prepared)
+            except ReferenceInputError as exc:
+                return error(400, str(exc))
+            except GenerationError as exc:
+                logger.error("audio reference preprocessing unavailable: %s", exc)
+                return error(500, str(exc))
+            try:
+                song_id = await provider.upload_reference(
+                    prepared, f"{Path(name).stem or 'reference'}.mp3"
+                )
+            except GenerationError as exc:
+                logger.warning("audio reference upload failed: %s", exc)
+                return error(502, str(exc))
+            entry = new_reference_entry(song_id, name, duration, prepared.name)
+            async with request.app.state.reference_lock:
+                existing = load_references(application_settings.output_dir)
+                for old in existing:
+                    if old["id"] == song_id and old.get("audio") != prepared.name:
+                        (directory / Path(str(old.get("audio") or "")).name).unlink(missing_ok=True)
+                save_references(
+                    application_settings.output_dir,
+                    [entry, *(old for old in existing if old["id"] != song_id)],
+                )
+            registered = True
+            return JSONResponse(
+                status_code=status.HTTP_201_CREATED, content=_reference_response(entry, request)
+            )
+        finally:
+            await file.close()
+            raw_path.unlink(missing_ok=True)
+            if not registered:
+                prepared.unlink(missing_ok=True)
+
+    @application.delete(
+        "/api/references/{reference_id}",
+        status_code=status.HTTP_204_NO_CONTENT,
+        responses={404: {"model": ErrorResponse}},
+    )
+    async def delete_audio_reference(reference_id: str, request: Request):
+        async with request.app.state.reference_lock:
+            existing = load_references(application_settings.output_dir)
+            entry = next((item for item in existing if item["id"] == reference_id), None)
+            if entry is None:
+                return JSONResponse(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    content={"success": False, "message": "参考音频不存在。"},
+                )
+            save_references(
+                application_settings.output_dir,
+                [item for item in existing if item["id"] != reference_id],
+            )
+        audio = Path(str(entry.get("audio") or "")).name
+        if audio:
+            (references_dir(application_settings.output_dir) / audio).unlink(missing_ok=True)
+        # ElevenLabs has no documented delete endpoint for uploaded songs; only local state goes.
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @application.get("/api/jobs")
     async def generation_history(request: Request):
@@ -2511,10 +2677,12 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="Audio file not found") from exc
         # 隐藏目录一律不对外：.trash 是软删除区，.mix-* 是合轨的中间产物。
-        if any(part.startswith(".") for part in relative.parts) or relative.parts[:1] in {
-            ("rvc",),
-            ("logs",),
-        }:
+        if (
+            any(part.startswith(".") for part in relative.parts)
+            or relative.parts[:1] in {("rvc",), ("logs",)}
+            # Only the reference preview clips are public, not the index.
+            or (relative.parts[:1] == ("references",) and relative.suffix != ".mp3")
+        ):
             raise HTTPException(status_code=404, detail="Audio file not found")
         expiry = None
         if len(relative.parts) >= 2 and relative.parts[0] == "jobs":
@@ -2638,6 +2806,26 @@ def _generation_parameters(
     ):
         return prompt, None
     return prompt, settings.normalize_duration(payload.durationMinutes)
+
+
+def _audio_reference(payload: GenerateRequest, settings: Settings) -> AudioReference | None:
+    if payload.referenceId is None:
+        return None
+    if (payload.provider or settings.music_provider) != "elevenlabs_music":
+        raise ValueError("音频参考仅支持 ElevenLabs 模型，MiniMax 不支持。")
+    if settings.music_api_mode != "real":
+        raise ValueError("音频参考需要 MUSIC_API_MODE=real。")
+    if settings.elevenlabs_music_model_id not in ELEVENLABS_REFERENCE_MODELS:
+        raise ValueError("音频参考仅支持 ElevenLabs music_v2 / music_v2_5 模型。")
+    if settings.elevenlabs_force_instrumental:
+        raise ValueError("音频参考不能与 ELEVENLABS_FORCE_INSTRUMENTAL=true 同时使用。")
+    entry = find_reference(settings.output_dir, payload.referenceId)
+    if entry is None:
+        raise ValueError("参考音频不存在或已删除，请重新选择。")
+    duration_ms = int(min(float(entry["durationSeconds"]), REFERENCE_MAX_SECONDS) * 1000)
+    return AudioReference(
+        entry["id"], duration_ms, settings.elevenlabs_reference_condition_strength
+    )
 
 
 def _public_base_url(request: Request, settings: Settings) -> str:
