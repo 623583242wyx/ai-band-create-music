@@ -10,6 +10,7 @@ import httpx
 import pytest
 
 from app.main import create_app
+from app.services.prompt import OpenAICompatiblePromptExpander, PreparedPrompt
 from tests.helpers import (
     BlockingPromptExpander,
     StubMusicProvider,
@@ -84,6 +85,49 @@ async def test_generate_validates_prompt_boundaries(tmp_path: Path) -> None:
     assert maximum.status_code == 200
     assert too_long.status_code == 400
     assert "2000" in too_long.json()["message"]
+
+
+@pytest.mark.parametrize("endpoint", ["/api/generate", "/api/jobs"])
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "[歌词与创作内容]\n\n[风格要求]",
+        "[歌词与创作内容]\n\n[风格要求]\n",
+        "[歌词与创作内容]\r\n \t\r\n[风格要求]\r\n \t",
+        "[歌词与创作内容]\n \t",
+        "[风格要求]\n \t",
+    ],
+)
+async def test_generation_rejects_empty_lyrics_and_style_before_creating_job(
+    tmp_path: Path, endpoint: str, prompt: str
+) -> None:
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    orchestrator.prompt_expander.prepare = AsyncMock()
+    app = create_app(settings, orchestrator)
+    async with await _client(app) as client:
+        response = await client.post(endpoint, json={"prompt": prompt})
+
+    assert response.status_code == 400
+    assert response.json() == {"success": False, "message": "歌词和风格至少需要提供一项。"}
+    orchestrator.prompt_expander.prepare.assert_not_awaited()
+    assert app.state.jobs == {}
+    assert not list((settings.output_dir / "jobs").glob("*/job.json"))
+
+
+@pytest.mark.parametrize("prompt", ["[风格要求]\n摇滚", "[歌词与创作内容]\n\n[风格要求]\n摇滚"])
+async def test_generate_accepts_style_with_empty_lyrics(tmp_path: Path, prompt: str) -> None:
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+    orchestrator.prompt_expander.prepare = AsyncMock(
+        return_value=PreparedPrompt("[Genre: Rock]", "[verse]\n自动生成的测试歌词", None)
+    )
+    app = create_app(settings, orchestrator)
+    async with await _client(app) as client:
+        response = await client.post("/api/generate", json={"prompt": prompt})
+
+    assert response.status_code == 200
+    assert orchestrator.prompt_expander.prepare.await_args.args[0] == prompt
 
 
 async def test_generate_preserves_not_ready_response(tmp_path: Path) -> None:
@@ -253,6 +297,45 @@ async def test_ai_talk_lyrics_are_tagged_before_music_generation(tmp_path: Path)
     assert provider.user_prompt == (
         "[歌词与创作内容]\n[Verse]\n第一句\n第二句\n\n[风格要求]\n梦幻流行"
     )
+
+
+@pytest.mark.parametrize("provider_name", ["minimax_music", "elevenlabs_music"])
+async def test_lyrics_only_inferred_style_reaches_music_provider(
+    tmp_path: Path, provider_name: str
+) -> None:
+    settings = make_settings(tmp_path, llm_api_key="secret", llm_base_url="https://llm.test/v1")
+    style = (
+        "[Genre: Mandarin rock], [Tempo: 132 BPM in 4/4], [Mood: Uplifting], "
+        "[Instrumentation: Electric guitars and drums], [Vocal: Clear Mandarin lead], "
+        "[Arrangement: Verse and chorus], [Production: Clean stereo mix], "
+        "[Negative Constraints: No buried vocals]"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        messages = json.loads(request.content)["messages"]
+        assert "根据歌词的主题、情绪、意象和语言节奏推断" in messages[1]["content"]
+        content = json.dumps({"taggedLyrics": "[Verse]\n第一句\n第二句", "styleTags": style})
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as llm_client:
+        orchestrator = make_orchestrator(
+            settings, prompt_expander=OpenAICompatiblePromptExpander(settings, llm_client)
+        )
+        provider = StubMusicProvider(settings.mock_full_song_path, provider_name)
+        provider.generate = AsyncMock(wraps=provider.generate)
+        orchestrator.music_providers = {provider_name: provider}
+        app = create_app(settings, orchestrator)
+        async with await _client(app) as client:
+            response = await client.post(
+                "/api/generate",
+                json={"prompt": "[歌词与创作内容]\n第一句\n第二句", "provider": provider_name},
+            )
+
+    assert response.status_code == 200
+    assert response.json()["lyrics"] == "[verse]\n第一句\n第二句"
+    assert response.json()["structuredPrompt"] == style
+    assert provider.user_prompt == "[歌词与创作内容]\n[verse]\n第一句\n第二句"
+    assert provider.generate.await_args.args[0] == style
 
 
 async def test_minimax_ignores_fixed_duration_and_preserves_user_lyrics(tmp_path: Path) -> None:

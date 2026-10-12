@@ -68,7 +68,7 @@ from app.services.job_files import (
     stored_path_exists,
 )
 from app.services.orchestrator import GenerationOrchestrator
-from app.services.prompt import OpenAICompatiblePromptExpander
+from app.services.prompt import OpenAICompatiblePromptExpander, split_generation_prompt
 from app.services.providers import (
     ELEVENLABS_REFERENCE_MODELS,
     AudioReference,
@@ -2796,6 +2796,8 @@ def _generation_parameters(
         raise ValueError("prompt 不能为空，请输入歌曲风格描述。")
     if len(prompt) > settings.prompt_max_chars:
         raise ValueError(f"prompt 不能超过 {settings.prompt_max_chars} 个字符。")
+    if not any(split_generation_prompt(prompt)):
+        raise ValueError("歌词和风格至少需要提供一项。")
     if payload.durationSeconds is not None:
         return prompt, payload.durationSeconds / 60
     if payload.durationMinutes is None or (
