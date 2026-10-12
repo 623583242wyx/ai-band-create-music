@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     elevenlabs_clear_chinese_vocal_mode: bool = True
     elevenlabs_force_instrumental: bool = False
     elevenlabs_bypass_global_proxy: bool = True
+    # Audio reference (conditioning_ref) is documented for music_v2 / music_v2_5 only.
+    elevenlabs_reference_condition_strength: Literal["low", "medium", "high", "xhigh"] = "medium"
+    elevenlabs_reference_max_upload_mb: int = Field(default=30, ge=1, le=200)
 
     suno_create_timeout_seconds: float = Field(default=180, gt=0)
     suno_make_instrumental: bool = False
@@ -185,6 +188,10 @@ class Settings(BaseSettings):
         if self.cors_origins.strip() == "*":
             return ["*"]
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
+
+    @property
+    def elevenlabs_reference_max_upload_bytes(self) -> int:
+        return self.elevenlabs_reference_max_upload_mb * 1024 * 1024
 
     @property
     def rvc_max_upload_bytes(self) -> int:

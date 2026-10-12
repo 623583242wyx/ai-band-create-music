@@ -16,7 +16,7 @@ from app.schemas import SongGenerationState
 from app.services.audio_files import ensure_file_under_root, make_playback_mp3
 from app.services.job_files import job_song_dir, update_job_diagnostics
 from app.services.prompt import PromptExpander, split_generation_prompt
-from app.services.providers import MusicProvider
+from app.services.providers import AudioReference, MusicProvider
 from app.services.stems import StemSeparator
 from app.services.waveforms import extract_waveforms
 
@@ -104,6 +104,7 @@ class GenerationOrchestrator:
         provider: str | None = None,
         count: int = 1,
         title: str | None = None,
+        reference: AudioReference | None = None,
     ) -> dict[str, Any]:
         job_id = job_id or f"job_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
         selected_provider = provider or self.settings.music_provider
@@ -176,6 +177,7 @@ class GenerationOrchestrator:
                 provider=selected_provider,
                 requestedCount=count,
                 effectiveCount=effective_count,
+                audioReferenceId=reference.song_id if reference else None,
                 structuredPrompt=None,
                 lyrics=None,
             )
@@ -310,6 +312,8 @@ class GenerationOrchestrator:
                         variation=index,
                         progress=provider_progress,
                         job_id=job_id,
+                        # Only ElevenLabs accepts a reference; callers validate the provider.
+                        **({"reference": reference} if reference is not None else {}),
                     )
                     if task_progress is not None:
                         task_progress = min(99, int(song_number / effective_count * 100))
