@@ -54,6 +54,10 @@ async def test_health_preserves_legacy_contract(tmp_path: Path) -> None:
     assert body["splitting"]["enabled"] is True
     assert body["splitting"]["mode"] == "on_demand"
     assert body["splitting"]["device"] == "auto"
+    assert body["splitting"]["engine"] == "bs_roformer"
+    assert body["splitting"]["model"] == "roformer-model-bs-roformer-sw-by-jarredou"
+    assert body["splitting"]["stems"] == ["vocal", "drums", "bass", "guitar", "piano", "other"]
+    assert body["splitting"]["timeoutSeconds"] == 1800
     assert body["replacement"] == {
         "conversionTimeoutSeconds": 1800,
         "workersHoldingCapacityAfterTerminal": 0,

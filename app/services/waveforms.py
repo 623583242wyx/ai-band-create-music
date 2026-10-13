@@ -18,7 +18,7 @@ WAVEFORM_BIN_COUNT = 640
 
 
 def summarize_waveform(samples: np.ndarray, bin_count: int = WAVEFORM_BIN_COUNT) -> list[float]:
-    """Reduce mono PCM samples to normalized RMS bins for the multitrack editor.
+    """Reduce PCM frames to RMS bins normalized to each track's peak.
 
     640 bins is what the editor lanes draw at full width; at 64 the envelope reads as
     a few blobs instead of a waveform. The default is shared with
@@ -26,7 +26,8 @@ def summarize_waveform(samples: np.ndarray, bin_count: int = WAVEFORM_BIN_COUNT)
     """
     if samples.size == 0 or bin_count <= 0:
         return []
-    edges = np.linspace(0, samples.size, min(bin_count, samples.size) + 1, dtype=int)
+    frame_count = samples.shape[0]
+    edges = np.linspace(0, frame_count, min(bin_count, frame_count) + 1, dtype=int)
     rms = np.array(
         [
             np.sqrt(np.mean(np.square(samples[start:end], dtype=np.float64)))
@@ -34,6 +35,8 @@ def summarize_waveform(samples: np.ndarray, bin_count: int = WAVEFORM_BIN_COUNT)
         ],
         dtype=np.float64,
     )
+    # Suppress low-level residue in every track before preserving its normal display height.
+    rms[rms < 1e-3] = 0
     maximum = float(rms.max(initial=0))
     if maximum <= 0:
         return [0.0] * len(rms)
@@ -52,9 +55,7 @@ async def extract_waveform(path: Path, bin_count: int = WAVEFORM_BIN_COUNT) -> l
         "-i",
         str(path),
         "-ac",
-        "1",
-        "-ar",
-        "8000",
+        "2",
         "-f",
         "f32le",
         "pipe:1",
@@ -73,18 +74,21 @@ async def extract_waveform(path: Path, bin_count: int = WAVEFORM_BIN_COUNT) -> l
     if process.returncode != 0:
         detail = stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"波形提取失败：{path.name}，{detail or 'ffmpeg 无输出'}")
-    return summarize_waveform(np.frombuffer(stdout, dtype="<f4"), bin_count)
+    return summarize_waveform(np.frombuffer(stdout, dtype="<f4").reshape(-1, 2), bin_count)
 
 
 async def extract_waveforms(
     paths: dict[str, Path], *, progress: Callable[[int, int], None] | None = None
 ) -> dict[str, list[float]]:
     finished = 0
+    # Native-rate stereo decoding uses more memory than the former 8 kHz mono stream.
+    semaphore = asyncio.Semaphore(2)
 
     async def extract(name: str, path: Path) -> tuple[str, list[float]] | None:
         nonlocal finished
         try:
-            result = name, await extract_waveform(path)
+            async with semaphore:
+                result = name, await extract_waveform(path)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

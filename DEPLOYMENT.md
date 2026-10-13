@@ -64,14 +64,14 @@ tar -xzf ../ai-band-generate-module.tar.gz
 tar -xzf ../ai-band-rvc-assets.tar.gz
 cp .env.example .env
 chmod 600 .env
-mkdir -p output/.torch-cache output/.hf-cache
+mkdir -p output/.bs-roformer-models
 ```
 
 编辑 `.env`，至少设置真实的 `LLM_API_KEY`、音乐 Provider 配置。宿主机端口可用 `APP_PORT` 修改；宿主机用户不是 UID/GID 1000 时，设置 `APP_UID` 和 `APP_GID`，确保容器能写入 `output`。
 
 缓存目录也必须由容器用户写入。若目录由 root 创建或从其他机器迁移，启动前按 `.env`
 中的实际 UID/GID 修正权限，例如默认配置执行 `sudo chown -R 1000:1000 output`。
-提前创建 `.torch-cache` 可避免 Docker 自动创建 root 所有的挂载目录，导致 Demucs 报权限错误。
+模型缓存目录 `output/.bs-roformer-models` 也必须由容器用户写入，供 BS-RoFormer 权重下载与校验。
 当前 Compose 默认启用 SSH 隧道代理，发起联网业务前先完成下面的代理配置；服务器可以直接联网时，
 按“停用代理”移除代理配置后再启动。
 
@@ -251,10 +251,10 @@ Provider 已联通；还需按实际业务验证。
   的客户端通常请求失败，不会自动回退直连。流量消耗本机带宽，受本机代理规则和出口影响。
   SSH 保护本机与服务器之间的隧道，容器到宿主机段及代理出口段不因此获得额外加密；
   使用 HTTPS 并保留证书验证，不要用关闭 TLS 校验解决连通问题。
-- **第三方镜像：** `HF_ENDPOINT=https://hf-mirror.com` 为支持该变量的 Hugging Face 客户端
-  切换镜像，`HF_HOME=/app/output/.hf-cache` 持久化缓存；当前镜像站在 `NO_PROXY` 中。
-  镜像服务有可用性和供应链风险，私有资源的令牌可能随客户端请求发送给所配置的镜像，
-  不要向不信任的镜像发送凭据。
+- **模型下载：** BS-RoFormer 固定从运行库登记的 HTTPS 地址下载权重，并校验 SHA-256。
+  下载使用全局 HTTP/HTTPS 代理，缓存位于 `output/.bs-roformer-models`；该运行库不读取
+  `HF_ENDPOINT` 或 `HF_HOME`，不能通过这些变量更改其下载位置。离线部署应先用 README
+  中的预下载命令准备模型，再把整个缓存目录随 `output` 迁移。
 
 #### 升级时保留网桥
 
@@ -306,8 +306,7 @@ docker compose up -d --force-recreate api
 
    网桥变更后应使用实际添加的规则参数；不要清空整个 INPUT 链或 Docker/Tailscale 规则。
 
-镜像配置可独立选择：不用 Hugging Face 镜像时，删除 `HF_ENDPOINT`（默认回到官方端点）
-或改为 `https://huggingface.co`，并重建容器；`HF_HOME` 和 `.torch-cache` 挂载可以保留。
+停用代理后，模型权重下载改走直接 HTTPS；已缓存且校验通过的权重无需重复下载。
 不要为停用代理删除 `output` 或模型缓存，否则会丢失结果或触发重新下载。
 
 ### 构建源与缓存说明
@@ -315,7 +314,8 @@ docker compose up -d --force-recreate api
 当前 Dockerfile 在 builder 阶段将匹配到的 Debian `http://deb.debian.org` 地址替换为清华镜像，
 设置 `UV_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple`、`UV_HTTP_TIMEOUT=3000`（秒），
 并通过 BuildKit 缓存挂载复用 `/root/.cache/uv`。构建缓存与容器模型缓存是两回事：
-`./output/.torch-cache` 挂载到 `/app/.torch-cache`，供应用固定路径下的 Demucs/Torch 缓存使用。
+BS-RoFormer 使用 `./output/.bs-roformer-models`（容器内 `/app/output/.bs-roformer-models`），
+随已有 `output` 卷持久化；无需额外缓存挂载。
 
 **运行时 Compose 代理不会自动用于 `docker compose build`，也不会为 Docker daemon 拉取镜像
 提供代理。** 最终镜像的 `ffmpeg` 安装仍使用该阶段原有 Debian 源；项目的 `pyproject.toml`

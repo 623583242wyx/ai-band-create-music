@@ -28,11 +28,17 @@ from app.services.stems import prepare_ffmpeg_environment
 
 logger = logging.getLogger(__name__)
 
-MIX_FILTER = (
-    "[0:a]pan=stereo|c0=c0|c1=c0,equalizer=f=3000:t=q:w=1:g=2.5[vocal];"
-    "[vocal][1:a][2:a][3:a]"
-    "amix=inputs=4:duration=longest:dropout_transition=0:normalize=0[premix]"
-)
+
+def build_mix_filter(input_count: int) -> str:
+    labels = "[vocal]" + "".join(f"[{index}:a]" for index in range(1, input_count))
+    return (
+        "[0:a]pan=stereo|c0=c0|c1=c0,equalizer=f=3000:t=q:w=1:g=2.5[vocal];"
+        f"{labels}amix=inputs={input_count}:duration=longest:"
+        "dropout_transition=0:normalize=0[premix]"
+    )
+
+
+MIX_FILTER = build_mix_filter(4)
 LIMIT_FILTER = (
     "volume={gain_db:.3f}dB,alimiter=limit=0.891251:attack=5:release=50:level=false:latency=true"
 )
@@ -433,7 +439,7 @@ async def mix_tracks(
     gains: list[float] | None = None,
     track_outputs: list[Path] | None = None,
 ) -> None:
-    """Render saved linear gains, or the legacy four-track export when gains are omitted."""
+    """Render saved linear gains, or a legacy export when gains are omitted."""
     try:
         await _mix_steps(
             inputs,
@@ -550,7 +556,7 @@ async def _mix_steps(
     command.extend(
         (
             "-filter_complex",
-            MIX_FILTER,
+            build_mix_filter(len(inputs)),
             "-map",
             "[premix]",
             "-ar",
@@ -674,7 +680,7 @@ async def _run_ffmpeg(
     *,
     capture_stdout: bool = False,
 ) -> str:
-    """跑一个 ffmpeg/ffprobe 步骤；用法与 stems.py 的 Demucs 执行器保持一致。
+    """跑一个 ffmpeg/ffprobe 步骤；用法与 stems.py 的 BS-RoFormer 执行器保持一致。
 
     与旧实现（Popen + 50ms 轮询 + 在事件循环上阻塞 wait）相比，命令、参数与超时预算语义
     都没有变化，但不再阻塞事件循环，并显式关闭子进程 stdin（ffprobe 命令没带 `-nostdin`）。

@@ -57,7 +57,7 @@ def test_complete_generation_over_real_http(tmp_path: Path) -> None:
         assert split.status_code == 202
         assert body["durationMinutes"] == 2
         assert body["structuredPrompt"].startswith("[Genre: Test]")
-        assert sorted(downloads) == ["bass", "drums", "other", "vocal"]
+        assert sorted(downloads) == ["bass", "drums", "guitar", "other", "piano", "vocal"]
         assert all(response.status_code == 200 for response in downloads.values())
         assert all(
             response.content[:4] == b"RIFF" and response.content[8:12] == b"WAVE"

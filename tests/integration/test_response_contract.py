@@ -164,3 +164,27 @@ def test_successful_job_can_never_be_missing_alternatives(tmp_path):
     degraded = _job_response(job, fake_request(object()), settings, include_waveforms=False)
     assert degraded["result"]["count"] == 2
     assert len(degraded["result"]["alternatives"]) == 0
+
+
+def test_all_song_variants_put_guitar_and_piano_above_other(tmp_path):
+    settings = make_settings(tmp_path)
+    job = _job("ordered", status="succeeded", count=2)
+    original_order = ["vocal", "drums", "bass", "other", "guitar", "piano", "recording_1"]
+    job.result["mixed"] = _song("jobs/ordered/mixed.wav")
+    for song in (job.result, job.result["alternatives"][0], job.result["mixed"]):
+        song["stems"] = {name: f"jobs/ordered/{name}.wav" for name in original_order}
+        song["splitEnabled"] = True
+
+    rendered = _job_response(job, fake_request(object()), settings)["result"]
+    for song in (rendered, rendered["alternatives"][0], rendered["mixed"]):
+        assert list(song["stems"]) == [
+            "vocal",
+            "drums",
+            "bass",
+            "guitar",
+            "piano",
+            "other",
+            "recording_1",
+        ]
+        assert song["stemUrls"] == list(song["stems"].values())
+    assert list(job.result["stems"]) == original_order

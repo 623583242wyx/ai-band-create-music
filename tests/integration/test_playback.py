@@ -22,6 +22,7 @@ from app.services.audio_files import make_playback_mp3
 from app.services.job_files import capture_mix_artifact, drop_mix_artifact, restore_mix_artifact
 from app.services.orchestrator import GenerationOrchestrator
 from app.services.retention import cleanup_expired_jobs
+from app.services.stems import STEM_NAMES
 from tests.helpers import make_orchestrator, make_settings
 
 
@@ -260,7 +261,7 @@ async def test_partial_stem_preview_failure_keeps_split_successful(
     assert orchestrator.capacity.active == 0
     stems = completed["result"]["stems"]
     previews = completed["result"]["playback"]["stems"]
-    assert set(stems) == {"vocal", "drums", "bass", "other"}
+    assert set(stems) == set(STEM_NAMES)
     assert all(url.endswith(".wav") for url in stems.values())
     assert set(previews) == set(stems) - {"vocal", "drums"}
     assert all(url.endswith(".mp3") for url in previews.values())
@@ -308,7 +309,7 @@ async def test_cancel_during_preview_only_stops_encoders(
         encoding = (await client.get(f"/api/jobs/{job_id}")).json()
         assert encoding["splitStatus"] == "running"
         assert encoding["operationStage"] == "preview"
-        # 容量在编码前就让给了下一个 Demucs 任务（分支 reduce-audio-stress 的既定取舍），
+        # 容量在编码前就让给了下一个 BS-RoFormer 任务（分支 reduce-audio-stress 的既定取舍），
         # 编码并发由 app.services.audio_files 的信号量单独限制。
         assert orchestrator.capacity.active == 0
         cancelled = (await client.patch(f"/api/jobs/{job_id}", json={"status": "cancelled"})).json()
@@ -355,7 +356,7 @@ async def test_stem_delete_and_restore_rejected_while_preview_encodes(
             )
         ).json()
 
-    assert set(restored["result"]["stems"]) == {"vocal", "drums", "bass", "other"}
+    assert set(restored["result"]["stems"]) == set(STEM_NAMES)
     # 试听编码被取消过，恢复出来的分轨只有 WAV，没有可回填的 preview。
     assert "stems" not in restored["result"]["playback"]
 

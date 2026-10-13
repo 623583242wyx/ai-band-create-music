@@ -106,7 +106,7 @@ async def prepare_reference_audio(source: Path, target: Path) -> float:
 
     environment = prepare_ffmpeg_environment()
     target.parent.mkdir(parents=True, exist_ok=True)
-    await _run(
+    await run_audio_command(
         [
             "ffmpeg",
             "-v",
@@ -135,7 +135,7 @@ async def prepare_reference_audio(source: Path, target: Path) -> float:
         environment,
         "无法解析该音频文件，请上传常见格式（MP3、WAV、FLAC、M4A 等）的音频。",
     )
-    output = await _run(
+    output = await run_audio_command(
         [
             "ffprobe",
             "-v",
@@ -159,7 +159,7 @@ async def prepare_reference_audio(source: Path, target: Path) -> float:
     return round(min(duration, REFERENCE_MAX_SECONDS), 3)
 
 
-async def _run(
+async def run_audio_command(
     command: list[str], environment: dict[str, str], message: str, *, capture: bool = False
 ) -> str:
     try:

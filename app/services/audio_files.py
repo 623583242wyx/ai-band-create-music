@@ -16,8 +16,8 @@ from app.core.errors import GenerationError
 
 logger = logging.getLogger(__name__)
 PLAYBACK_ENCODE_TIMEOUT_SECONDS = 120
-# 试听编码是纯 CPU 的 ffmpeg 子进程：分轨任务的容量配额在编码前就让给了下一个 Demucs
-# 任务，所以这里必须自己限并发，否则 4–6 个 ffmpeg 会和 Demucs 抢同一批核。
+# 试听编码是纯 CPU 的 ffmpeg 子进程：分轨任务的容量配额在编码前就让给了下一个 BS-RoFormer
+# 任务，所以这里必须自己限并发，否则 4–6 个 ffmpeg 会和 BS-RoFormer 抢同一批核。
 PLAYBACK_ENCODE_CONCURRENCY = os.cpu_count() or 2
 _encoder_gates: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
     weakref.WeakKeyDictionary()

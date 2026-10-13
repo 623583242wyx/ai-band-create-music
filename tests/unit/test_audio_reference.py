@@ -54,11 +54,12 @@ async def test_reference_conditions_first_chunk_of_free_plan(tmp_path: Path) -> 
 
     assert [request.url.path for request in requests] == ["/v1/music/plan", "/v1/music/stream"]
     plan_body = json.loads(requests[0].content)
-    assert plan_body["model_id"] == "music_v2"
+    assert plan_body["model_id"] == "music_v2_5"
     assert "第一句\n第二句" in plan_body["prompt"]
     assert "music_length_ms" not in plan_body
     music_body = json.loads(requests[1].content)
     assert set(music_body) == {"composition_plan", "model_id"}
+    assert music_body["model_id"] == "music_v2_5"
     first, second = music_body["composition_plan"]["chunks"]
     assert first["conditioning_ref"] == {
         "song_id": "song_abc",

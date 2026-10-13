@@ -182,13 +182,15 @@ async def test_four_stages_follow_work_and_post_get_sse_agree(tmp_path, monkeypa
             assert (detail["operationStage"], detail["operationProgress"]) == ("completed", 100)
             assert all(row["operationProgress"] < 100 for row in frames[:-1])
             if operation == "split":
-                # 四轨导出按实际完成数量递增，最后一轨结束仍只能报 99。
+                # 六轨导出按实际完成数量递增，最后一轨结束仍只能报 99。
                 assert [
                     row["operationProgress"] for row in frames if row["operationStage"] == "preview"
                 ] == [
-                    81,
+                    79,
+                    83,
                     87,
-                    93,
+                    91,
+                    95,
                     99,
                 ]
             assert seen == [row[0] for row in STAGES[operation]]

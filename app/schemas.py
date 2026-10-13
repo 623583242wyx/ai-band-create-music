@@ -90,6 +90,16 @@ class ErrorResponse(BaseModel):
     message: str
 
 
+class RecordingUploadResponse(BaseModel):
+    id: str
+    name: str
+    audioUrl: str
+    playbackUrl: str | None = None
+    durationSeconds: float
+    waveform: list[float]
+    audioRevision: int
+
+
 class PlaybackUrls(BaseModel):
     fullTrack: str | None = Field(default=None, exclude_if=lambda value: value is None)
     replacedVocal: str | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -109,6 +119,7 @@ class MusicOutput(BaseModel):
     replacedVocal: str | None = Field(default=None, exclude_if=lambda value: value is None)
     durationSeconds: float | None = None
     stems: dict[str, str]
+    stemNames: dict[str, str] | None = Field(default=None, exclude_if=lambda value: value is None)
     stemUrls: list[str]
     waveforms: dict[str, list[float]]
     splitEnabled: bool
