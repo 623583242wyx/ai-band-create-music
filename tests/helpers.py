@@ -108,6 +108,7 @@ def make_settings(tmp_path: Path, **updates: object) -> Settings:
         "rvc_model_path": rvc_model,
         "rvc_index_path": None,
         "rvc_base_model_dir": None,
+        "bs_roformer_models_dir": tmp_path / "model-cache",
     }
     values.update(updates)
     return Settings(_env_file=None, **values)

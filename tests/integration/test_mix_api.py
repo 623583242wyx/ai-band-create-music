@@ -166,6 +166,30 @@ def assert_error(response, status):
     return body
 
 
+async def test_legacy_export_includes_guitar_and_piano(tmp_path, install_stubs):
+    mixer = install_stubs()
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    job = seed_job(app, settings)
+    for name in ("guitar", "piano"):
+        path = settings.output_dir / "jobs" / job.job_id / "song_1" / f"demo_{name}.wav"
+        path.write_bytes(b"RIFF-stub")
+        job.result["stems"][name] = path.relative_to(settings.output_dir).as_posix()
+    async with client(app) as http:
+        response = await http.post(f"/api/jobs/{job.job_id}/mix")
+        assert response.status_code == 202, response.text
+        await job.mix_task
+    assert job.mix_status == "succeeded", job.mix_error
+    assert [path.stem for path in mixer.calls[0][0]] == [
+        "demo_rvc_vocal",
+        "demo_drums",
+        "demo_bass",
+        "demo_other",
+        "demo_guitar",
+        "demo_piano",
+    ]
+
+
 def record_path(settings, job):
     return settings.output_dir / "jobs" / job.job_id / "job.json"
 

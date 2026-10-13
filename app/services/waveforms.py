@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 
@@ -15,10 +16,25 @@ logger = logging.getLogger(__name__)
 # 该值必须同时作为 summarize_waveform 与 extract_waveform 的默认值，否则同一次拆轨
 # 里 "full" 与各分轨的 bin 数量不一致，客户端的公共 x 轴会错位。
 WAVEFORM_BIN_COUNT = 640
+# 原采样率立体声解码每轨可达上百 MB：全进程（而非每次调用）最多同时解码两轨，
+# 拆轨、录音上传与合轨并发时内存上限不会随请求数叠加。
+WAVEFORM_DECODE_CONCURRENCY = 2
+_decode_gates: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Semaphore] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _decode_gate() -> asyncio.Semaphore:
+    """按事件循环懒建解码闸门（模块级信号量跨循环复用会绑定到已关闭的循环）。"""
+    loop = asyncio.get_running_loop()
+    gate = _decode_gates.get(loop)
+    if gate is None:
+        gate = _decode_gates[loop] = asyncio.Semaphore(WAVEFORM_DECODE_CONCURRENCY)
+    return gate
 
 
 def summarize_waveform(samples: np.ndarray, bin_count: int = WAVEFORM_BIN_COUNT) -> list[float]:
-    """Reduce mono PCM samples to normalized RMS bins for the multitrack editor.
+    """Reduce PCM frames to RMS bins normalized to each track's peak.
 
     640 bins is what the editor lanes draw at full width; at 64 the envelope reads as
     a few blobs instead of a waveform. The default is shared with
@@ -26,7 +42,8 @@ def summarize_waveform(samples: np.ndarray, bin_count: int = WAVEFORM_BIN_COUNT)
     """
     if samples.size == 0 or bin_count <= 0:
         return []
-    edges = np.linspace(0, samples.size, min(bin_count, samples.size) + 1, dtype=int)
+    frame_count = samples.shape[0]
+    edges = np.linspace(0, frame_count, min(bin_count, frame_count) + 1, dtype=int)
     rms = np.array(
         [
             np.sqrt(np.mean(np.square(samples[start:end], dtype=np.float64)))
@@ -34,6 +51,8 @@ def summarize_waveform(samples: np.ndarray, bin_count: int = WAVEFORM_BIN_COUNT)
         ],
         dtype=np.float64,
     )
+    # Suppress low-level residue in every track before preserving its normal display height.
+    rms[rms < 1e-3] = 0
     maximum = float(rms.max(initial=0))
     if maximum <= 0:
         return [0.0] * len(rms)
@@ -52,9 +71,7 @@ async def extract_waveform(path: Path, bin_count: int = WAVEFORM_BIN_COUNT) -> l
         "-i",
         str(path),
         "-ac",
-        "1",
-        "-ar",
-        "8000",
+        "2",
         "-f",
         "f32le",
         "pipe:1",
@@ -73,7 +90,7 @@ async def extract_waveform(path: Path, bin_count: int = WAVEFORM_BIN_COUNT) -> l
     if process.returncode != 0:
         detail = stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"波形提取失败：{path.name}，{detail or 'ffmpeg 无输出'}")
-    return summarize_waveform(np.frombuffer(stdout, dtype="<f4"), bin_count)
+    return summarize_waveform(np.frombuffer(stdout, dtype="<f4").reshape(-1, 2), bin_count)
 
 
 async def extract_waveforms(
@@ -84,7 +101,8 @@ async def extract_waveforms(
     async def extract(name: str, path: Path) -> tuple[str, list[float]] | None:
         nonlocal finished
         try:
-            result = name, await extract_waveform(path)
+            async with _decode_gate():
+                result = name, await extract_waveform(path)
         except asyncio.CancelledError:
             raise
         except Exception as exc:

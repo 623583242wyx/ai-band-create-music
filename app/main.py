@@ -11,8 +11,9 @@ import re
 import shutil
 import stat
 import tempfile
+import unicodedata
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -22,7 +23,7 @@ from uuid import uuid4
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import ValidationError
@@ -42,6 +43,7 @@ from app.schemas import (
     GenerateRequest,
     GenerateResponse,
     GenerationJobResponse,
+    RecordingUploadResponse,
     TrackMixRequest,
     UpdateGenerationJobRequest,
 )
@@ -74,6 +76,7 @@ from app.services.providers import (
     AudioReference,
     create_music_provider,
 )
+from app.services.recordings import prepare_recording_audio
 from app.services.references import (
     REFERENCE_DIR,
     REFERENCE_MAX_SECONDS,
@@ -96,7 +99,12 @@ from app.services.retention import (
     retention_lifecycle,
     retention_status,
 )
-from app.services.stems import STEM_NAMES, DemucsStemSeparator, is_vocal_stem
+from app.services.stems import (
+    BS_ROFORMER_MODEL,
+    STEM_NAMES,
+    BSRoFormerStemSeparator,
+    is_vocal_stem,
+)
 from app.services.voice import (
     RVCConversionError,
     RVCEngine,
@@ -117,9 +125,6 @@ SPLIT_COMPLETE_PROGRESS = 100
 MIX_PROGRESS = 76
 MIX_PREVIEW_PROGRESS = 95
 MIX_INPUT_SUFFIXES = frozenset({".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm"})
-# 合轨输入固定是"人声 + 其余分轨"，顺序即滤镜图里的 [0:a]..[3:a]；分轨名单以 stems 为准。
-MIX_VOCAL_STEM = "vocal"
-MIX_BACKING_STEMS = tuple(name for name in STEM_NAMES if name != MIX_VOCAL_STEM)
 REPLACE_COMPLETE_PROGRESS = 100
 # 替换已经进入终态（超时/取消），但 RVC 推理线程还没退出、因而仍占着一个生成并发额度的数量。
 # 额度按设计等到线程真正退出才释放，这里只把它暴露出来，让 /api/health 与日志能发现卡住的替换。
@@ -139,7 +144,10 @@ class RequestSizeLimitMiddleware:
             await self.app(scope, receive, send)
             return
 
-        limit = self.path_limits.get(scope["path"], self.default_limit)
+        path = scope["path"]
+        limit = self.path_limits.get(path, self.default_limit)
+        if re.fullmatch(r"/api/jobs/[^/]+/recordings", path):
+            limit = self.path_limits.get("/api/jobs/*/recordings", self.default_limit)
         content_length = Headers(scope=scope).get("content-length")
         if content_length is not None:
             try:
@@ -219,6 +227,7 @@ class GenerationJob:
     last_operation: str | None = field(default=None, repr=False)
     split_task: asyncio.Task[None] | None = field(default=None, repr=False)
     split_song: int | None = field(default=None, repr=False)
+    split_variant: str | None = field(default=None, repr=False)
     split_status: str | None = field(default=None, repr=False)
     split_stage: str | None = field(default=None, repr=False)
     split_progress: int | None = field(default=None, repr=False)
@@ -452,7 +461,7 @@ def build_orchestrator(
         prompt_expander=OpenAICompatiblePromptExpander(settings, client),
         music_provider=music_providers.get(settings.music_provider)
         or create_music_provider(settings, client, direct_client),
-        stem_separator=DemucsStemSeparator(settings),
+        stem_separator=BSRoFormerStemSeparator(settings),
         task_dispatcher=InlineTaskDispatcher(),
         events=NullEventPublisher(),
         music_providers=music_providers,
@@ -556,7 +565,10 @@ def create_app(
         # Multipart framing adds a little on top of the audio file itself.
         path_limits={
             "/api/references": application_settings.elevenlabs_reference_max_upload_bytes
-            + 1024 * 1024
+            + 1024 * 1024,
+            "/api/jobs/*/recordings": (application_settings.recording_max_upload_mb + 1)
+            * 1024
+            * 1024,
         },
     )
     application.state.reference_lock = asyncio.Lock()
@@ -600,11 +612,11 @@ def create_app(
             "splitting": {
                 "enabled": True,
                 "mode": "on_demand",
-                "profile": application_settings.split_profile,
-                "model": application_settings.demucs_model or None,
-                "device": application_settings.demucs_device or "auto",
-                "jobs": application_settings.demucs_jobs or None,
-                "segment": application_settings.demucs_segment or None,
+                "engine": "bs_roformer",
+                "model": BS_ROFORMER_MODEL,
+                "device": application_settings.bs_roformer_device,
+                "stems": list(STEM_NAMES),
+                "timeoutSeconds": application_settings.bs_roformer_timeout_seconds,
             },
             "mixing": {
                 "timeoutSeconds": application_settings.rvc_mix_timeout_seconds,
@@ -1131,7 +1143,12 @@ def create_app(
         },
     )
     async def split_generation_job(
-        job_id: str, request: Request, response: Response, song: int = 0
+        job_id: str,
+        request: Request,
+        response: Response,
+        song: int = 0,
+        force: bool = False,
+        variant: Literal["original", "mixed"] = "original",
     ):
         job = retained_job(request, job_id)
         if job is None:
@@ -1144,7 +1161,8 @@ def create_app(
                 status_code=status.HTTP_409_CONFLICT,
                 content={"success": False, "message": "生成任务尚未完成，无法拆轨。"},
             )
-        result = _song_result(job, song)
+        song_output = _song_result(job, song)
+        result = song_project(song_output, variant)
         if result is None or not isinstance(result.get("fullTrack"), str):
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1166,7 +1184,7 @@ def create_app(
                 },
             )
         if job.split_status in {"pending", "running"}:
-            if job.split_song == song:
+            if job.split_song == song and (job.split_variant or "original") == variant:
                 return await _async_job_response(job, request, application_settings)
             return JSONResponse(
                 status_code=status.HTTP_409_CONFLICT,
@@ -1176,9 +1194,18 @@ def create_app(
                 },
             )
         stems = result.get("stems")
-        if result.get("splitEnabled") or (isinstance(stems, dict) and stems):
+        if force:
+            try:
+                require_audio_revision(result, request.headers.get("X-Audio-Revision"))
+            except HTTPException as exc:
+                return JSONResponse(
+                    status_code=exc.status_code,
+                    content={"success": False, "message": exc.detail},
+                )
+        if not force and (result.get("splitEnabled") or (isinstance(stems, dict) and stems)):
             job.last_operation = "split"
             job.split_song = song
+            job.split_variant = variant
             job.split_error = None
             _mark_split_succeeded(job)
             response.status_code = status.HTTP_200_OK
@@ -1195,6 +1222,7 @@ def create_app(
 
         active_orchestrator = _orchestrator(request)
         job.split_song = song
+        job.split_variant = variant
         job.split_status = "pending"
         job.split_stage = "starting_split"
         job.split_progress = 0
@@ -1204,6 +1232,7 @@ def create_app(
             await active_orchestrator.capacity.acquire()
         except CapacityExceededError:
             job.split_song = None
+            job.split_variant = None
             job.split_status = None
             job.split_stage = None
             job.split_progress = None
@@ -1214,6 +1243,7 @@ def create_app(
             )
         except asyncio.CancelledError:
             job.split_song = None
+            job.split_variant = None
             job.split_status = None
             job.split_stage = None
             job.split_progress = None
@@ -1231,13 +1261,14 @@ def create_app(
         async def execute() -> None:
             wav_ready = False
             capacity_released = False
+            generated_paths: list[Path] = []
             try:
                 job.split_status = "running"
                 publish()
                 output_dir = job_song_dir(
                     application_settings.output_dir,
                     job_id,
-                    (result.get("songNumber") or song + 1) - 1,
+                    (song_output.get("songNumber") or song + 1) - 1,
                 )
                 relative_output = output_dir.relative_to(application_settings.output_dir)
                 await asyncio.to_thread(_read_operation_input, full_path)
@@ -1246,6 +1277,7 @@ def create_app(
                 job.split_message = "正在分离音轨"
                 publish()
                 split_result = await active_orchestrator.stem_separator.split(full_path, output_dir)
+                generated_paths = [output_dir / name for name in split_result.files.values()]
                 stems = {
                     name: (relative_output / file_name).as_posix()
                     for name, file_name in split_result.files.items()
@@ -1271,10 +1303,31 @@ def create_app(
                     },
                     progress=waveform_progress,
                 )
-                result["stems"] = stems
+                # 用户上传的录音（stemNames 里有显示名的音轨）不是模型产物，重新分轨时原样保留。
+                previous_stems = result.get("stems")
+                if not isinstance(previous_stems, dict):
+                    previous_stems = {}
+                previous_names = result.get("stemNames") or {}
+                recordings = {
+                    name: url
+                    for name, url in previous_stems.items()
+                    if name in previous_names and name not in stems
+                }
+                result["stems"] = {**stems, **recordings}
+                if recordings:
+                    result["stemNames"] = {name: previous_names[name] for name in recordings}
+                else:
+                    result.pop("stemNames", None)
                 playback = _playback_dict(result)
-                playback.pop("stems", None)
-                job.deleted_replaced_vocals.pop(str(song), None)
+                recording_previews = {
+                    name: preview
+                    for name, preview in (playback.pop("stems", None) or {}).items()
+                    if name in recordings
+                }
+                if recording_previews:
+                    playback["stems"] = dict(recording_previews)
+                if variant == "original":
+                    job.deleted_replaced_vocals.pop(str(song), None)
                 playback.pop("replacedVocal", None)
                 result.pop("replacedVocal", None)
                 result.pop("_replacedVocalModel", None)
@@ -1284,9 +1337,15 @@ def create_app(
                 drop_editor_state(result)
                 result["audioRevision"] = result.get("audioRevision", 0) + 1
                 invalidate_mix_artifact(job, result)
-                result["stemUrls"] = list(stems.values())
+                result["stemUrls"] = list(result["stems"].values())
                 previous_waveforms = result.get("waveforms")
                 merged_waveforms = dict(fresh_waveforms)
+                if isinstance(previous_waveforms, dict):
+                    merged_waveforms.update(
+                        (name, previous_waveforms[name])
+                        for name in recordings
+                        if name in previous_waveforms
+                    )
                 if (
                     "full" not in merged_waveforms
                     and isinstance(previous_waveforms, dict)
@@ -1301,7 +1360,9 @@ def create_app(
                 if not isinstance(debug, dict):
                     debug = result["debug"] = {}
                 debug["splitterDurationMs"] = split_result.duration_ms
-                deleted_prefix = f"{song}:"
+                debug["splitterEngine"] = "bs_roformer"
+                debug["splitterModel"] = BS_ROFORMER_MODEL
+                deleted_prefix = f"mixed:{song}:" if variant == "mixed" else f"{song}:"
                 job.deleted_stems = {
                     key: deleted
                     for key, deleted in job.deleted_stems.items()
@@ -1309,6 +1370,14 @@ def create_app(
                 }
                 job.save(application_settings.output_dir)
                 wav_ready = True
+                # 新分轨文件名带随机后缀，旧分轨、旧试听和已清理的删除记录不再被任何工程引用。
+                stale_paths = _referenced_output_paths(
+                    [previous_result, previous_deleted_stems], application_settings
+                ) - _referenced_output_paths(
+                    [job.result, job.deleted_stems, job.deleted_replaced_vocals],
+                    application_settings,
+                )
+                await asyncio.to_thread(_unlink_paths, stale_paths)
                 await active_orchestrator.capacity.release()
                 capacity_released = True
                 job.split_stage = "preview"
@@ -1353,12 +1422,15 @@ def create_app(
                         if isinstance(preview, str) and preview
                     }
                     if previews:
-                        playback["stems"] = previews
+                        playback["stems"] = {**recording_previews, **previews}
                         job.save(application_settings.output_dir)
                 except asyncio.CancelledError:
                     # PATCH 在 preview 阶段只取消编码器（见 README 状态契约）：WAV 分轨保留，
                     # 任务照常按 succeeded 收尾，不把取消写成终态。
-                    playback.pop("stems", None)
+                    if recording_previews:
+                        playback["stems"] = dict(recording_previews)
+                    else:
+                        playback.pop("stems", None)
                     logger.info("stem previews cancelled job_id=%s song=%s", job_id, song)
                 _mark_split_succeeded(job)
             except asyncio.CancelledError:
@@ -1382,6 +1454,8 @@ def create_app(
                     result.update(previous_result)
                     job.deleted_stems = previous_deleted_stems
                     job.deleted_replaced_vocals = previous_deleted_vocals
+                    previous_paths = _referenced_output_paths(previous_result, application_settings)
+                    _unlink_paths({path.resolve() for path in generated_paths} - previous_paths)
                 if not capacity_released:
                     await active_orchestrator.capacity.release()
                 publish()
@@ -1964,6 +2038,11 @@ def create_app(
                     else {}
                 )
                 target["stemUrls"] = list(target["stems"].values())
+                target["stemNames"] = {
+                    track.id: result["stemNames"][track.stemId]
+                    for track in mix.tracks
+                    if track.stemId in result.get("stemNames", {}) and track.id in target["stems"]
+                }
                 target["splitEnabled"] = split
                 playback = {}
                 if previews[0]:
@@ -2196,6 +2275,171 @@ def create_app(
         return None
 
     @application.post(
+        "/api/jobs/{job_id}/recordings",
+        response_model=RecordingUploadResponse,
+        status_code=status.HTTP_201_CREATED,
+        responses={
+            400: {"model": ErrorResponse},
+            404: {"model": ErrorResponse},
+            409: {"model": ErrorResponse},
+            413: {"model": ErrorResponse},
+            429: {"model": ErrorResponse},
+            500: {"model": ErrorResponse},
+        },
+    )
+    async def upload_recording(
+        job_id: str,
+        request: Request,
+        name: Annotated[str, Form(min_length=1, max_length=100)],
+        file: Annotated[UploadFile, File()],
+        song: int = 0,
+        variant: Literal["original", "mixed"] = "original",
+    ):
+        def error(code: int, message: str) -> JSONResponse:
+            return JSONResponse(status_code=code, content={"success": False, "message": message})
+
+        def current_project():
+            job = retained_job(request, job_id)
+            if job is None:
+                return error(404, "生成任务不存在。")
+            if job.status != "succeeded":
+                return error(409, "生成任务尚未完成，无法上传录音。")
+            output = _song_result(job, song)
+            result = song_project(output, variant)
+            if result is None:
+                return error(404, "歌曲不存在。")
+            conflict = _mix_conflict(job)
+            if conflict is not None:
+                return conflict
+            if not result.get("splitEnabled"):
+                return error(409, "请先完成分轨，再上传录音。")
+            try:
+                require_audio_revision(result, request.headers.get("X-Audio-Revision"))
+            except HTTPException as exc:
+                return error(exc.status_code, exc.detail)
+            if len(result.get("stems", {})) >= 32:
+                return error(409, "每首歌曲最多保留 32 条音轨。")
+            return job, output, result
+
+        capacity = None
+        registered = False
+        created: list[Path] = []
+        try:
+            name = name.strip()
+            # Cc 控制字符与 Cf 格式字符（双向覆盖、零宽空格）都会让显示名伪装成别的内容；
+            # ZWNJ/ZWJ 是波斯语、印度系文字与组合 emoji 的正常组成部分，予以放行。
+            if not name or any(
+                unicodedata.category(char) in {"Cc", "Cf"} and char not in "\u200c\u200d"
+                for char in name
+            ):
+                return error(400, "录音名称须为 1–100 个字符，不能包含控制字符或不可见格式字符。")
+            selected = current_project()
+            if isinstance(selected, JSONResponse):
+                return selected
+            job, output, result = selected
+            revision = result.get("audioRevision", 0)
+            directory = job_song_dir(
+                application_settings.output_dir, job_id, (output.get("songNumber") or song + 1) - 1
+            )
+            upload_capacity = _orchestrator(request).capacity
+            try:
+                await upload_capacity.acquire()
+            except CapacityExceededError:
+                return error(429, "当前音频处理任务过多，请稍后重试。")
+            capacity = upload_capacity
+            directory.mkdir(parents=True, exist_ok=True)
+            stem_id = f"recording_{uuid4().hex}"
+            prefix = "mixed_" if variant == "mixed" else ""
+            with tempfile.TemporaryDirectory(prefix=".recording-", dir=directory) as staging:
+                raw_path = Path(staging) / "input"
+                prepared = Path(staging) / f"{prefix}{stem_id}.wav"
+                written = 0
+                with raw_path.open("wb") as raw:
+                    while chunk := await file.read(1024 * 1024):
+                        written += len(chunk)
+                        if written > application_settings.recording_max_upload_mb * 1024 * 1024:
+                            return error(
+                                413,
+                                "录音文件不能超过 "
+                                f"{application_settings.recording_max_upload_mb} MB。",
+                            )
+                        raw.write(chunk)
+                if not written:
+                    return error(400, "上传的文件为空。")
+                try:
+                    duration = await prepare_recording_audio(
+                        raw_path, prepared, application_settings.max_duration_minutes * 60
+                    )
+                except ReferenceInputError as exc:
+                    return error(400, str(exc))
+                waveforms = await extract_waveforms({stem_id: prepared})
+                preview = await make_playback_mp3(prepared, application_settings.output_dir)
+                # 解码期间工程可能被覆盖、删除或开始其它操作；发布前再次验证。
+                selected = current_project()
+                if isinstance(selected, JSONResponse):
+                    return selected
+                current_job, _, current_result = selected
+                if (
+                    current_job is not job
+                    or current_result is not result
+                    or (result.get("audioRevision", 0) != revision)
+                ):
+                    return error(409, "歌曲版本已更新，请刷新后重试。")
+                target = directory / prepared.name
+                prepared.replace(target)
+                created.append(target)
+                preview_path = None
+                if preview:
+                    staged_preview = application_settings.output_dir / preview
+                    preview_path = directory / "playtrack" / staged_preview.name
+                    preview_path.parent.mkdir(exist_ok=True)
+                    staged_preview.replace(preview_path)
+                    created.append(preview_path)
+                previous = copy.deepcopy(result)
+                try:
+                    relative = target.relative_to(application_settings.output_dir).as_posix()
+                    result.setdefault("stems", {})[stem_id] = relative
+                    result.setdefault("stemNames", {})[stem_id] = name
+                    result["stemUrls"] = list(result["stems"].values())
+                    result.setdefault("waveforms", {}).update(waveforms)
+                    if preview_path:
+                        _playback_dict(result).setdefault("stems", {})[stem_id] = (
+                            preview_path.relative_to(application_settings.output_dir).as_posix()
+                        )
+                    result["audioRevision"] = revision + 1
+                    job.save(application_settings.output_dir)
+                except BaseException:
+                    result.clear()
+                    result.update(previous)
+                    raise
+                registered = True
+                _publish_job(job, request, snapshot=True)
+                base_url = _public_base_url(request, application_settings)
+                return {
+                    "id": stem_id,
+                    "name": name,
+                    "audioUrl": build_public_audio_url(base_url, relative),
+                    "playbackUrl": build_public_audio_url(
+                        base_url, preview_path.relative_to(application_settings.output_dir)
+                    )
+                    if preview_path
+                    else None,
+                    "durationSeconds": duration,
+                    "waveform": waveforms.get(stem_id, []),
+                    "audioRevision": revision + 1,
+                }
+        except (GenerationError, OSError, ValueError) as exc:
+            logger.exception("recording upload failed job_id=%s", job_id)
+            return error(500, public_error_reason(exc))
+        finally:
+            if not registered:
+                for path in created:
+                    path.unlink(missing_ok=True)
+            await file.close()
+            if capacity is not None:
+                await capacity.release()
+
+    @application.post(
         "/api/jobs/{job_id}/mix",
         response_model=GenerationJobResponse,
         status_code=status.HTTP_202_ACCEPTED,
@@ -2298,9 +2542,11 @@ def create_app(
         # 替换人声只属于原曲：替换后那首里的 `replaced` 已经是普通音轨（source=stem）。
         vocal_url = result.get("replacedVocal") if variant == "original" else None
         stems = result.get("stems")
-        stem_urls = [
-            stems.get(name) if isinstance(stems, dict) else None for name in MIX_BACKING_STEMS
-        ]
+        # 旧无请求体导出仍要求原四轨伴奏，同时保留六轨模型及录音产生的额外音轨。
+        backing_names = ["drums", "bass", "other"]
+        if isinstance(stems, dict):
+            backing_names.extend(name for name in stems if name not in {*backing_names, "vocal"})
+        stem_urls = [stems.get(name) if isinstance(stems, dict) else None for name in backing_names]
         selected_urls = [vocal_url, *stem_urls]
         if mix is not None:
             selected_urls = [
@@ -2405,7 +2651,7 @@ def create_app(
             )
         if job.split_task is not None and not job.split_task.done():
             job.split_task.cancel()
-            # 取消只有在 WAV 落盘之前（Demucs 分离、波形提取）才是终态：那时没有任何分轨
+            # 取消只有在 WAV 落盘之前（模型分离、波形提取）才是终态：那时没有任何分轨
             # 产物对外可见。preview 阶段的取消只作用于编码器——WAV 分轨与波形都已落盘，任务
             # 本身会照常按 succeeded 收尾（见 README 状态契约）。此处改写 split_status 会让
             # PATCH 的响应与随后的最终状态互相矛盾：客户端把 "cancelled" 当终态就再也看不到
@@ -2536,6 +2782,8 @@ def create_app(
             "index": stem_index,
             "waveform": waveforms.get(stem_name) if isinstance(waveforms, dict) else None,
         }
+        if stem_name in result.get("stemNames", {}):
+            deleted_entry["name"] = result["stemNames"].pop(stem_name)
         playback = result.get("playback")
         stem_playback = playback.get("stems") if isinstance(playback, dict) else None
         if isinstance(stem_playback, dict):
@@ -2644,6 +2892,8 @@ def create_app(
         items = list(stems.items())
         items.insert(min(deleted["index"], len(items)), (stem_name, deleted["url"]))
         result["stems"] = dict(items)
+        if isinstance(deleted.get("name"), str):
+            result.setdefault("stemNames", {})[stem_name] = deleted["name"]
         if isinstance(deleted.get("playback"), str):
             _playback_dict(result).setdefault("stems", {})[stem_name] = deleted["playback"]
         result["stemUrls"] = list(result["stems"].values())
@@ -3155,6 +3405,7 @@ def _render_result_urls(
     include_waveforms: bool = True,
 ) -> dict[str, Any]:
     rendered = copy.deepcopy(result if include_waveforms else _without_waveforms(result))
+    stem_order = {name: index for index, name in enumerate(STEM_NAMES)}
     songs = [rendered, *rendered.get("alternatives", [])]
     for song in songs:
         normalize_mixed_song(song)
@@ -3170,7 +3421,10 @@ def _render_result_urls(
         if isinstance(stems, dict):
             output["stems"] = {
                 name: _public_audio_url(url, base_url, settings)
-                for name, url in stems.items()
+                for name, url in sorted(
+                    stems.items(),
+                    key=lambda item: stem_order.get(item[0].rsplit(":", 1)[-1], len(stem_order)),
+                )
                 if isinstance(url, str)
             }
             output["stemUrls"] = list(output["stems"].values())
@@ -3255,6 +3509,30 @@ def _public_audio_url(audio_url: str, base_url: str, settings: Settings) -> str:
 
 def _output_path_from_url(audio_url: str, settings: Settings):
     return output_path_from_url(audio_url, settings.output_dir)
+
+
+def _referenced_output_paths(value: Any, settings: Settings) -> set[Path]:
+    """Collect every output audio file referenced anywhere inside a job structure."""
+    found: set[Path] = set()
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(entry for entry in item if isinstance(entry, (dict, list, str)))
+        elif isinstance(item, str) and item.lower().endswith(tuple(MIX_INPUT_SUFFIXES)):
+            with suppress(ValueError):
+                found.add(_output_path_from_url(item, settings))
+    return found
+
+
+def _unlink_paths(paths: set[Path]) -> None:
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("stale audio cleanup skipped path=%s", path, exc_info=True)
 
 
 def _stem_trash_path(target, settings: Settings, job_id: str, song: int = 0):

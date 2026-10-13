@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = "==3.10.*"
 dependencies = [
     "anyio>=4,<5",
-    "demucs[quantized]>=4.0.1,<5",
+    "bs-roformer-infer==0.1.5",
     "fastapi>=0.115,<1",
     "httpx[socks]>=0.28,<1",
     "imageio-ffmpeg>=0.5.1,<1",

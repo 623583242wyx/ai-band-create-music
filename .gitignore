@@ -24,7 +24,6 @@ dist/
 # Runtime artifacts and logs
 output/*
 !output/.gitkeep
-.torch-cache/
 *.log
 
 # Local editor and OS files

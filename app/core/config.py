@@ -97,15 +97,10 @@ class Settings(BaseSettings):
     minimax_num_inference_steps: int = Field(default=30, ge=1, le=100)
     minimax_timeout_seconds: float = Field(default=7200, gt=0)
 
-    split_profile: Literal["fast", "balanced", "quality"] = "fast"
-    split_timeout_seconds: float = Field(default=1800, gt=0)
-    split_keep_workdir: bool = False
-    demucs_model: str = ""
-    demucs_device: str = ""
-    demucs_jobs: str = ""
-    demucs_shifts: str = ""
-    demucs_overlap: str = ""
-    demucs_segment: str = ""
+    bs_roformer_device: str = Field(default="auto", pattern=r"^(auto|cpu|cuda(?::[0-9]+)?)$")
+    bs_roformer_models_dir: Path = PROJECT_ROOT / "output" / ".bs-roformer-models"
+    bs_roformer_timeout_seconds: float = Field(default=1800, gt=0, allow_inf_nan=False)
+    recording_max_upload_mb: int = Field(default=50, ge=1, le=200)
 
     rvc_model_path: Path = Field(
         default_factory=lambda: _default_rvc_asset("weights", "*.pth", "model.pth")
@@ -133,6 +128,7 @@ class Settings(BaseSettings):
         "output_dir",
         "mock_full_song_path",
         "rvc_model_path",
+        "bs_roformer_models_dir",
         mode="before",
     )
     @classmethod

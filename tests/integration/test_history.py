@@ -9,6 +9,7 @@ from starlette.requests import Request
 from app.core.errors import CapacityExceededError
 from app.main import GenerationJob, create_app, load_jobs
 from app.services.prompt import PreparedPrompt
+from app.services.stems import STEM_NAMES
 from tests.helpers import make_orchestrator, make_settings
 
 
@@ -40,7 +41,7 @@ async def time_out(awaitable, *_args, **_kwargs):
 
 def split_waveforms() -> dict[str, list[float]]:
     """拆轨会连同 "full" 一起重新提取波形，桩函数必须返回同样的音轨集合。"""
-    return {"full": [0.25], **{name: [0.5] for name in ("vocal", "drums", "bass", "other")}}
+    return {"full": [0.25], **{name: [0.5] for name in STEM_NAMES}}
 
 
 async def test_direct_history_restart(tmp_path):
@@ -271,11 +272,11 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
     assert history_running["result"]["waveforms"] == {}
     assert completed["status"] == "succeeded"
     assert completed["result"]["splitEnabled"] is True
-    assert sorted(completed["result"]["stems"]) == ["bass", "drums", "other", "vocal"]
+    assert sorted(completed["result"]["stems"]) == sorted(STEM_NAMES)
     assert completed["result"]["waveforms"]["vocal"] == [0.5]
     # 拆轨必须重新提取 "full"，否则客户端会拿到长度不一致的波形车道。
-    assert set(extract.await_args.args[0]) == {"full", "vocal", "drums", "bass", "other"}
-    assert set(completed["result"]["waveforms"]) == {"full", "vocal", "drums", "bass", "other"}
+    assert set(extract.await_args.args[0]) == {"full", *STEM_NAMES}
+    assert set(completed["result"]["waveforms"]) == {"full", *STEM_NAMES}
     assert cached.status_code == 200
     assert cached.json()["status"] == "succeeded"
     cache_guard.assert_not_called()
@@ -283,7 +284,7 @@ async def test_history_song_starts_async_split_and_updates_result(tmp_path, monk
     assert resplit_result["result"]["stems"] == {}
     # 首次拆轨推进文件版本；删除与缓存命中都不再改动它。
     assert resplit_result["result"]["audioRevision"] == 1
-    assert len(app.state.jobs[job_id].deleted_stems) == 4
+    assert len(app.state.jobs[job_id].deleted_stems) == len(STEM_NAMES)
 
 
 async def test_split_reserves_job_before_capacity_await(tmp_path, monkeypatch):
@@ -716,7 +717,7 @@ async def test_first_split_resets_previous_project_state(tmp_path, monkeypatch):
     assert "mixedTrack" not in completed and "replacedVocal" not in completed
     assert "mixedTrack" not in completed["playback"]
     assert "replacedVocal" not in completed["playback"]
-    assert set(completed["waveforms"]) == {"full", "vocal", "drums", "bass", "other"}
+    assert set(completed["waveforms"]) == {"full", *STEM_NAMES}
     assert completed["audioRevision"] == 1
     # 旧的工程控制状态字段不再出现在任务结果里。
     assert "editorState" not in completed and "projectRevision" not in completed

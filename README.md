@@ -8,7 +8,7 @@ AI 音乐生成与 RVC 人声替换的纯 FastAPI 后端。项目使用 `uv` 固
 - OpenAI-compatible LLM 音乐 Prompt 结构化扩写与质量校验
 - ElevenLabs Music API（直接 Prompt）
 - Suno sidecar 和 Generic Provider 兼容适配器
-- 内置 Demucs `vocal / drums / bass / other` 四轨分离实现（当前生成管线未启用）
+- 内置 BS-RoFormer `vocal / drums / bass / guitar / piano / other` 六轨分离实现（按需执行）
 - RVC 人声替换、结果下载、软删除与恢复
 - `/api/health`、`/api/generate` 和 `/output/*` 音频访问接口
 - 本地内联任务执行，以及队列、缓存、事件发布的可替换接口
@@ -26,7 +26,7 @@ cp .env.example .env
 ```
 
 当前依赖固定为 Linux `torch/torchaudio 2.7.1+cu128`，用于支持 RTX 50 系列
-Blackwell `sm_120`；Demucs 和 RVC 共用这一套 CUDA 环境，不再安装 CPU Torch。
+Blackwell `sm_120`；BS-RoFormer 和 RVC 共用这一套 CUDA 环境，不再安装 CPU Torch。
 运行拆轨或默认的 RVC 配置需要可用的 NVIDIA 驱动和 CUDA GPU。
 
 编辑 `.env`，至少配置 LLM Key。`MUSIC_PROVIDER` 只是请求未传 `provider` 时的默认值；
@@ -338,7 +338,7 @@ sudo iptables -D INPUT ! -i br-e71e5f2bd0ad -p tcp --dport 7897 -j DROP
   客户端缓存旧音频。混音、波形、试听、发布、保存失败或取消都不更新当前成品与版本，保留
   本轮输入和可撤回文件，只清掉本轮新建的临时产物。成功后才清理无引用的旧文件，因此一次
   覆盖之后不能撤回上一版删除的文件。
-- 已有 `splitEnabled=true` 的歌曲再次 `/split` 直接返回当前保留音轨，不重跑 Demucs、
+- 已有 `splitEnabled=true` 的歌曲再次 `/split` 直接返回当前保留音轨，不重跑 BS-RoFormer、
   也不补回被移除的轨道。未建立分轨时首次分离会推进 `audioRevision`，让前端丢弃旧单轨页面
   的控制与撤回记录。
 - 分轨 DELETE/PUT 在修改前检查 `X-Audio-Revision`，替换产物 DELETE/PUT 检查 multipart
@@ -356,8 +356,8 @@ sudo iptables -D INPUT ! -i br-e71e5f2bd0ad -p tcp --dport 7897 -j DROP
 成功终态继续保留作为本次提交凭据，受理后的失败同样保留，前端据此退回对应的编辑页。
 前端不据此初始化控制：首次打开及文件版本更新后，M/S、音量与撤回栈都重新初始化。
 
-旧客户端在成品版本仍为 0 时可以不带请求体，继续使用“替换人声 + drums/bass/other”的固定
-四轨导出。这条兼容路径保留原 EQ、响度补偿和固定文件名，产出落成单轨的替换后那首；它不会提交
+旧客户端在成品版本仍为 0 时可以不带请求体，继续使用“替换人声 + 当前伴奏轨”的
+导出；四轨历史歌曲保持兼容，六轨歌曲会同时保留 guitar / piano，已上传的录音轨也会一并混入。这条兼容路径保留原 EQ、响度补偿和固定文件名，产出落成单轨的替换后那首；它不会提交
 母带或编辑状态。只有结果里还没有 `audioRevision`（本次部署之前生成、且再次 `/split` 命中
 缓存因而没有推进版本）时才会被受理：首次分离音轨就会把版本推到 1 以上，此后无请求体的
 导出一律 409。旧记录里的 `projectRevision`/
@@ -469,7 +469,7 @@ curl http://127.0.0.1:8010/api/jobs/<jobId>
 # 订阅阶段进度；收到具名 done 事件后客户端应主动关闭 EventSource
 curl -N http://127.0.0.1:8010/api/jobs/<jobId>/events
 
-# 对已完成的历史歌曲按需执行四轨分离；已有分轨时直接返回缓存
+# 对已完成的历史歌曲按需执行六轨分离；已有分轨时直接返回缓存
 curl -X POST 'http://127.0.0.1:8010/api/jobs/<jobId>/split?song=0'
 
 # 取消任务
@@ -632,8 +632,12 @@ WAV 被软删除或版本改变后，其旧 MP3 链接返回 404，撤回删除�
 并通过新增 WAV 地址字段提供给前端（需要同步适配），不能只改扩展名，也不能恢复压缩前的音质。
 
 `waveforms` 是每条音轨的归一化 RMS 包络，固定 640 个 bin
-（`app/services/waveforms.py` 的 `WAVEFORM_BIN_COUNT`）：多轨编辑器按车道满宽绘制时
-640 个点才像波形，且同一个 `waveforms` 字典内的所有音轨共享同一长度，客户端可以用同一
+（`app/services/waveforms.py` 的 `WAVEFORM_BIN_COUNT`）。每轨按自身峰值归一化到
+`0..1`，保留轨内强弱变化；波形高度表示轨内相对幅度，不用于比较不同轨的实际音量。
+归一化前将 RMS 低于 −60 dBFS 的采样段按静音显示，避免分离残留被放大成假波形。
+完整音频、所有分轨、替换人声、合轨和上传录音共用此规则；只影响波形数据，不修改音频。
+按原始采样率计算双声道能量，避免高频丢失或左右声道反相抵消。
+多轨编辑器按车道满宽绘制时 640 个点才像波形，且同一个 `waveforms` 字典内的所有音轨共享同一长度，客户端可以用同一
 根 x 轴对齐。因此：
 
 - `GET /api/jobs/{jobId}` 返回真实包络；`GET /api/jobs` 是历史列表投影，其中的
@@ -645,15 +649,52 @@ WAV 被软删除或版本改变后，其旧 MP3 链接返回 404，撤回删除�
 - 拆轨时会连同 `full` 一起重新提取波形：早期版本把 `full` 存成 64 个 bin，重新提取后
   同一首歌的所有车道都统一为 640 个 bin，不会出现长短不一的车道。
 
-## 按需四轨分离
+## 按需六轨分离
+
+后端使用 [BS-RoFormer-SW](https://github.com/openmirlab/bs-roformer-infer)，固定输出
+`vocal / drums / bass / guitar / piano / other` 六轨，guitar 和 piano 排在 other 前面。
+详情及 SSE 响应也会按此顺序排列已有歌曲的分轨。运行库固定为 `bs-roformer-infer==0.1.5`，
+与现有 Python 3.10、NumPy 1.23.5、CUDA Torch 2.7.1 兼容。只保留这三个分轨配置：
+
+```env
+BS_ROFORMER_DEVICE=cuda
+BS_ROFORMER_MODELS_DIR=./output/.bs-roformer-models
+BS_ROFORMER_TIMEOUT_SECONDS=1800
+```
+
+代码默认设备为 `auto`（有 CUDA 用 CUDA，否则 CPU）；可显式设置 `cpu`、`cuda` 或
+`cuda:N`，指定的 CUDA 设备不可用时直接报错。首次分轨自动下载并校验六轨权重，约 700 MB；
+缓存目录必须可写，Docker 使用 `output` 挂载持久化，不对外提供下载。也可部署前预下载：
+
+```bash
+uv run bs-roformer-download --model roformer-model-bs-roformer-sw-by-jarredou \
+  --output-dir ./output/.bs-roformer-models
+```
+
+分轨在独立子进程运行：先把母带转为 44.1 kHz 双声道 WAV，再执行六轨模型；转换、
+首次权重下载和推理共用一个超时预算。六轨全部生成并验证后才发布，每次生成独立文件名，
+失败或取消不会覆盖当前音频，临时目录会清理。模型额外产生的 instrumental 不加入编辑器，
+避免重复播放伴奏；模型的 `vocals` 映射成既有的 `vocal` 键。前端应遍历实际 `stems` 键。
+
+已有工程默认继续按缓存返回；要重建当前母带的六轨，调用
+`POST /api/jobs/{jobId}/split?song=0&variant=original&force=true` 并带
+`X-Audio-Revision: <当前 audioRevision>`。返回 `202` 后继续通过 GET/SSE 等待；成功会将
+`audioRevision` 加 1，`debug.splitterEngine=bs_roformer`、`debug.splitterModel` 记录实际模型。
+`variant` 可选 `original` / `mixed`，分别重建原曲或替换后的工程。
+`force=true` 会重置所选工程的草稿音轨及其命名、删除撤回和人声替换结果；需要保留的录音与音量调整应
+先合轨提交到母带。母带和其它候选歌曲不受影响，失败或在结果发布前取消会回滚旧工程。
+未带 `force` 时仍保持原有的缓存、删除车道不自动补回的行为。
 
 音乐生成只产出完整混音，不会自动拆轨。从历史记录进入编辑时，调用分轨接口执行
-Demucs 四轨分离并通过任务 SSE 推送真实进度；`splitEnabled=true`（或 `stems` 非空）时
-直接返回**当前保留的音轨**，不会重新运行 Demucs，也不会补回被移除的轨道 —— 再次编辑
+BS-RoFormer 六轨分离并通过任务 SSE 推送真实进度；`splitEnabled=true`（或 `stems` 非空）时
+未请求 `force=true` 时直接返回**当前保留的音轨**，不会重新运行 BS-RoFormer，也不会补回被移除的轨道 —— 再次编辑
 只编辑保留下来的文件。尚未建立分轨时首次分离会推进 `audioRevision`，让前端丢弃旧单轨
 页面的控制与撤回记录；分离出的原始人声与伴奏就是此后编辑与混音的输入。
 
-拆轨的 `operationStage` 依次经过 `starting_split`（读取输入，0）、`splitting`（Demucs，25）、
+`GET /api/health` 的 `splitting` 字段返回 `engine`、`model`、`device`、`stems`、
+`timeoutSeconds`；Demucs 时代的 `profile`、`jobs`、`segment` 已移除。
+
+拆轨的 `operationStage` 依次经过 `starting_split`（读取输入，0）、`splitting`（BS-RoFormer，25）、
 `waveform`（真实波形，50–75）、`preview`（每轨试听 MP3，75–99）和 `completed`。
 `operationProgress` 按实际处理波形/试听轨道数更新；只有结果可用且操作成功时才报告 100、
 `splitStatus=succeeded` 和 `operationStatus=succeeded`。POST、GET 与 SSE 共用独立操作字段，
@@ -673,6 +714,82 @@ SSE 保存阶段快照，队列最多 16 帧；慢客户端积压时丢弃最旧
   降级为 WAV。`/split`、`/replace` 的同类冲突防护不变。
 - 单轨试听编码失败或被取消只影响那一轨（该 key 不出现在 `result.playback.stems`），
   不会把整个分轨判为失败。
+
+## Track 页面：用户录音上传
+
+`POST /api/jobs/{jobId}/recordings?song=0&variant=original`，请求使用
+`multipart/form-data`，只有两个业务字段：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `name` | 文本，必填 | 录音名称，去掉首尾空白后不能为空；最多 100 字，禁止控制字符和不可见格式字符（双向覆盖、零宽空格等；ZWNJ/ZWJ 允许） |
+| `file` | 音频文件，必填 | 浏览器录音 Blob 或本地文件；支持 WebM/Opus、MP4/M4A、WAV、MP3、OGG、FLAC、AAC |
+
+`song` 从 0 开始，选择候选歌曲；`variant` 为 `original` 或 `mixed`，与现有分轨、合轨接口
+一致。上传前歌曲必须生成成功且完成分轨（`splitEnabled=true`）；单轨歌曲先调用 `/split`。
+请求头 `X-Audio-Revision` 填当前工程的 `audioRevision`，未提供按 0 验证。
+默认文件上限 50 MB，由 `RECORDING_MAX_UPLOAD_MB` 设置；时长上限跟随
+`MAX_DURATION_MINUTES`，默认 360 秒。按音频内容解码，不依赖扩展名和 MIME；
+服务端只读取本地音频容器，不接受播放列表或远程音频地址。
+
+成功同步返回 `201`，录音已保存，无需等待任务轮询：
+
+```json
+{
+  "id": "recording_0123456789abcdef0123456789abcdef",
+  "name": "我的和声",
+  "audioUrl": "http://localhost:8000/output/jobs/job-id/song_1/recording_0123456789abcdef0123456789abcdef.wav",
+  "playbackUrl": "http://localhost:8000/output/jobs/job-id/song_1/playtrack/recording_0123456789abcdef0123456789abcdef.playback-<version>.mp3",
+  "durationSeconds": 12.5,
+  "waveform": [0.2, 0.7, 0.4],
+  "audioRevision": 2
+}
+```
+
+`waveform` 通常为 640 个归一化 RMS 幅值，提取失败时为 `[]`；`playbackUrl` 是试听 MP3，
+编码失败时为 `null`，前端回落到 `audioUrl`。原始录音转成 44.1 kHz、双声道 PCM WAV
+作为合轨输入。示例中的波形与试听文件名已缩写。
+
+录音就是普通音轨：返回的 `id` 同时是 `stems[id]`、`waveforms[id]` 和
+`playback.stems[id]` 的键。新字段 `stemNames[id]` 保存用户命名，原有模型分轨没有命名
+时仍使用前端内置的标签。`GET /api/jobs/{jobId}`、SSE、历史记录和重启后均保留命名及音频。
+前端可直接使用上传响应添加车道，或重新获取任务详情；务必更新当前工程版本号，上传使
+`audioRevision` 加 1。每首工程最多 32 条音轨。
+
+```ts
+const form = new FormData();
+form.append("name", recordingName.trim());
+form.append("file", recordedBlob, "recording");
+const response = await fetch(
+  `${apiBase}/api/jobs/${jobId}/recordings?song=${song}&variant=${variant}`,
+  {
+    method: "POST",
+    headers: { "X-Audio-Revision": String(audioRevision) },
+    body: form,
+  },
+);
+// 不要手动设置 Content-Type，浏览器自动生成 multipart boundary。
+if (!response.ok) throw new Error((await response.json()).message ?? "录音上传失败");
+const recording = await response.json();
+// 用 recording.audioRevision 更新版本；默认音量 0 dB，从歌曲起点播放。
+```
+
+合轨继续调用 `/mix`，录音车道提交为
+`{"id":"recording_<id>","source":"stem","stemId":"recording_<id>","gainDb":0}`。
+选择录音后，必须在 `tracks` 中包含所有要保留的音轨；未列入的车道会按现有覆盖规则移除。
+合轨后保留所选录音的名称。删除与撤回复用
+`DELETE /api/jobs/{jobId}/stems/{id}` 和 `PUT /api/jobs/{jobId}/stems/{id}`，查询参数和
+版本头与上传相同。录音默认从 0 秒开始，合轨时按母带长度补静音或截断。
+
+错误沿用 `{ "success": false, "message": "..." }`：`400` 表示空白名称、空文件、
+无效音频或超长录音；`404` 表示任务/候选/替换后工程不存在；`409` 表示未完成生成/分轨、
+版本过期、音频操作冲突或音轨数已满；`413` 表示上传过大；`429` 表示处理容量已满；
+`500` 表示处理工具或存储故障。缺失字段、超出原始名称长度或查询参数无效时，
+FastAPI 返回标准 `422` 校验错误。解码失败、版本冲突、取消或存储失败均不增加车道，
+并清理本次临时文件。
+
+强制重新分轨（`/split?force=true`）只替换模型分轨：已上传的录音连同名称、波形与试听原样
+保留。重建成功后，不再被任何工程或撤回记录引用的旧分轨与旧试听文件会被删除。
 
 ## 本地基础设施模式
 
@@ -698,19 +815,19 @@ uv run pytest
 
 测试分为：
 
-- `tests/unit`：配置、Prompt、Provider、Demucs 命令和基础设施接口
+- `tests/unit`：配置、Prompt、Provider、BS-RoFormer 命令、音频预处理、完整发布、超时取消和基础设施接口
 - `tests/integration`：FastAPI API 契约、并发、音频下载
-- `tests/functional`：启动真实 Uvicorn TCP 服务完成生成与四轨下载
+- `tests/functional`：启动真实 Uvicorn TCP 服务完成生成与六轨下载
 
 `tests/functional/test_frontend_track_mix.py` 还会在临时副本里起同目录 `SHUJI-BAND`
 （可用 `SHUJI_FRONTEND_DIR` 指定）的真实 Next 路由，转发到真实 Uvicorn 与真实 FFmpeg，
 核对「完成创作」的覆盖提交链路。缺少前端检出、Node 或 ffmpeg 时该项跳过。
 
-真实 Demucs 冒烟测试默认跳过，因为首次运行需要下载模型且耗时较长：
+真实 BS-RoFormer 冒烟测试默认跳过，因为首次运行需要下载模型且耗时较长：
 
 ```bash
-RUN_REAL_DEMUCS_TEST=1 uv run pytest -m slow \
-  tests/functional/test_real_demucs_optional.py
+RUN_REAL_BS_ROFORMER_TEST=1 uv run pytest -m slow \
+  tests/functional/test_real_bs_roformer_optional.py
 ```
 
 质量检查：
@@ -722,7 +839,7 @@ uv run pytest --cov=app --cov-report=term-missing
 
 ## 运行约束
 
-本地内联执行使用进程内并发限制。Demucs 模式建议保持单 Uvicorn worker：
+本地内联执行使用进程内并发限制。BS-RoFormer 模式建议保持单 Uvicorn worker：
 
 ```text
 MAX_CONCURRENT_GENERATIONS=1

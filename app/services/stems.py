@@ -2,43 +2,29 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
-import math
 import os
 import re
 import shutil
 import sys
+import tempfile
+import wave
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 
-import anyio
-
-from app.core.config import PROJECT_ROOT, Settings
+from app.core.config import Settings
 from app.core.errors import GenerationError
 from app.services.audio_files import require_readable_file
 
-STEM_NAMES = ("vocal", "drums", "bass", "other")
+STEM_NAMES = ("vocal", "drums", "bass", "guitar", "piano", "other")
+BS_ROFORMER_MODEL = "roformer-model-bs-roformer-sw-by-jarredou"
+BS_ROFORMER_SAMPLE_RATE = 44_100
 
 
 def is_vocal_stem(name: str) -> bool:
     return name.lower().rsplit(":", 1)[-1] in {"vocal", "vocals", "voice", "replaced"}
-
-
-@dataclass(frozen=True, slots=True)
-class SplitProfile:
-    model: str
-    jobs: str
-    shifts: str
-    overlap: str
-    segment: str
-
-
-SPLIT_PROFILES = {
-    "fast": SplitProfile("mdx_q", "2", "1", "0.10", "12"),
-    "balanced": SplitProfile("htdemucs", "0", "1", "0.25", ""),
-    "quality": SplitProfile("htdemucs", "0", "2", "0.35", ""),
-}
-MODEL_MAX_SEGMENT_SECONDS = {"htdemucs": 7.8, "htdemucs_ft": 7.8, "htdemucs_6s": 7.8}
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,71 +39,42 @@ class StemSeparator(Protocol):
     async def split(self, input_path: Path, output_dir: Path) -> SplitResult: ...
 
 
-def require_demucs_runtime(device: str = "") -> None:
+def require_bs_roformer_runtime(device: str) -> None:
     missing = [
         name
-        for name in ("numpy", "torch", "demucs", "diffq")
+        for name in ("numpy", "torch", "bs_roformer", "soundfile")
         if importlib.util.find_spec(name) is None
     ]
     if missing:
         raise GenerationError(
-            f"Demucs 运行依赖缺失：{', '.join(missing)}。请执行 uv sync --frozen。"
+            f"BS-RoFormer 运行依赖缺失：{', '.join(missing)}。请执行 uv sync --frozen。"
         )
-    if device.lower().startswith("cuda"):
+    if device.startswith("cuda"):
         import torch
 
-        if not torch.cuda.is_available():
+        index = int(device.split(":", 1)[1]) if ":" in device else 0
+        if not torch.cuda.is_available() or index >= torch.cuda.device_count():
             raise GenerationError(
-                "DEMUCS_DEVICE 配置为 cuda，但 PyTorch 无法访问 CUDA。"
-                "请检查 NVIDIA 驱动及 PyTorch CUDA wheel。"
+                f"BS_ROFORMER_DEVICE={device} 不可用，请检查 NVIDIA 驱动和 CUDA GPU。"
             )
 
 
-def resolve_segment(model: str, configured: str, profile: SplitProfile) -> str:
-    segment = (
-        configured.strip()
-        if configured.strip()
-        else (profile.segment if model == profile.model else "")
-    )
-    if not segment:
-        return ""
-    try:
-        seconds = float(segment)
-    except ValueError as exc:
-        raise GenerationError(f"DEMUCS_SEGMENT 必须是正数，当前值：{segment}") from exc
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise GenerationError(f"DEMUCS_SEGMENT 必须是有限正数，当前值：{segment}")
-    maximum = MODEL_MAX_SEGMENT_SECONDS.get(model)
-    return str(maximum) if maximum is not None and seconds > maximum else segment
-
-
-def build_demucs_command(settings: Settings, input_path: Path, work_dir: Path) -> list[str]:
-    profile = SPLIT_PROFILES[settings.split_profile]
-    model = settings.demucs_model or profile.model
-    jobs = settings.demucs_jobs or profile.jobs
-    shifts = settings.demucs_shifts or profile.shifts
-    overlap = settings.demucs_overlap or profile.overlap
+def build_bs_roformer_command(settings: Settings, input_dir: Path, work_dir: Path) -> list[str]:
     command = [
         sys.executable,
         "-m",
-        "demucs",
-        "--name",
-        model,
-        "--out",
+        "bs_roformer.inference",
+        "--model",
+        BS_ROFORMER_MODEL,
+        "--models_dir",
+        str(settings.bs_roformer_models_dir),
+        "--input_folder",
+        str(input_dir),
+        "--store_dir",
         str(work_dir),
-        "--jobs",
-        jobs,
-        "--shifts",
-        shifts,
-        "--overlap",
-        overlap,
     ]
-    if settings.demucs_device:
-        command.extend(["--device", settings.demucs_device])
-    segment = resolve_segment(model, settings.demucs_segment, profile)
-    if segment:
-        command.extend(["--segment", segment])
-    command.append(str(input_path))
+    if settings.bs_roformer_device != "auto":
+        command.extend(["--device", settings.bs_roformer_device])
     return command
 
 
@@ -137,80 +94,141 @@ def prepare_ffmpeg_environment() -> dict[str, str]:
     raise GenerationError("音频处理需要 ffmpeg 和 ffprobe，请安装 static-ffmpeg 或系统 ffmpeg。")
 
 
-def _find_stem(work_dir: Path, stem_name: str) -> Path:
-    matches = list(work_dir.rglob(f"{stem_name}.wav"))
-    if not matches:
-        raise GenerationError(f"Demucs 已结束，但没有找到分轨文件：{stem_name}.wav")
-    return matches[0]
-
-
 def stem_output_files(input_path: Path) -> dict[str, str]:
     base_name = re.sub(r"[^\w\-. ]+", "_", input_path.stem, flags=re.UNICODE).strip(" ._")
     base_name = base_name[:160] or "music"
-    return {stem_name: f"{base_name}_{stem_name}.wav" for stem_name in STEM_NAMES}
+    return {name: f"{base_name}_{name}.wav" for name in STEM_NAMES}
 
 
-def _copy_stems(
-    work_dir: Path,
-    output_dir: Path,
-    output_files: dict[str, str],
+def publish_stems(
+    work_dir: Path, output_dir: Path, output_files: dict[str, str], expected_frames: int
 ) -> None:
-    demucs_names = {"vocal": "vocals", "drums": "drums", "bass": "bass", "other": "other"}
-    for public_name, demucs_name in demucs_names.items():
-        source = _find_stem(work_dir, demucs_name)
-        target = output_dir / output_files[public_name]
-        shutil.copy2(source, target)
-        require_readable_file(target, "拆轨输出文件为空")
+    """Validate all six outputs, then move them to fresh (uuid-named) targets."""
+    import soundfile as sf
+
+    sources = {
+        name: work_dir / f"source_{'vocals' if name == 'vocal' else name}.wav"
+        for name in STEM_NAMES
+    }
+    for source in sources.values():
+        require_readable_file(source, "BS-RoFormer 未生成完整的六轨结果")
+        try:
+            audio = sf.info(source)
+        except RuntimeError as exc:
+            raise GenerationError(f"BS-RoFormer 输出不是有效 WAV：{source.name}") from exc
+        if (
+            audio.format not in {"WAV", "WAVEX", "RF64"}
+            or audio.samplerate != BS_ROFORMER_SAMPLE_RATE
+            or audio.channels != 2
+            or audio.frames != expected_frames
+            or audio.frames <= 0
+        ):
+            raise GenerationError(f"BS-RoFormer 输出的格式或时长不匹配：{source.name}")
+    published: list[Path] = []
+    try:
+        for name, source in sources.items():
+            target = output_dir / output_files[name]
+            source.replace(target)
+            published.append(target)
+    except BaseException:
+        for target in published:
+            target.unlink(missing_ok=True)
+        raise
 
 
-class DemucsStemSeparator:
+class BSRoFormerStemSeparator:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
 
-    async def split(self, input_path: Path, output_dir: Path) -> SplitResult:
-        require_readable_file(input_path, "拆轨输入音频不可读")
-        require_demucs_runtime(self._settings.demucs_device)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        work_dir = output_dir / ".demucs_work"
-        await anyio.to_thread.run_sync(shutil.rmtree, work_dir, True)
-        work_dir.mkdir(parents=True, exist_ok=True)
-        environment = await anyio.to_thread.run_sync(prepare_ffmpeg_environment)
-        torch_home = PROJECT_ROOT / ".torch-cache"
-        torch_home.mkdir(parents=True, exist_ok=True)
-        environment.setdefault("TORCH_HOME", str(torch_home))
-        command = build_demucs_command(self._settings, input_path, work_dir)
-        output_files = stem_output_files(input_path)
-        started = asyncio.get_running_loop().time()
+    async def _run(
+        self, command: list[str], environment: dict[str, str], deadline: float, label: str
+    ) -> tuple[str, str]:
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            raise GenerationError(
+                f"BS-RoFormer 拆轨超时（{self._settings.bs_roformer_timeout_seconds:g} 秒）。"
+            )
         process = await asyncio.create_subprocess_exec(
             *command,
-            cwd=PROJECT_ROOT,
             env=environment,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(), timeout=self._settings.split_timeout_seconds
-                )
-            except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=remaining)
+        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+            with suppress(ProcessLookupError):
                 process.kill()
-                await process.wait()
-                if isinstance(exc, asyncio.CancelledError):
-                    raise
-                raise GenerationError(
-                    f"Demucs 拆轨超时（{self._settings.split_timeout_seconds:g} 秒）。"
-                ) from exc
-            stdout = stdout_bytes.decode("utf-8", errors="replace").strip()
-            stderr = stderr_bytes.decode("utf-8", errors="replace").strip()
-            if process.returncode != 0:
-                failure_detail = stderr or "无 stderr 输出"
-                raise GenerationError(
-                    f"Demucs 拆轨失败，退出码：{process.returncode}，stderr={failure_detail}"
-                )
-            await anyio.to_thread.run_sync(_copy_stems, work_dir, output_dir, output_files)
-            duration_ms = int((asyncio.get_running_loop().time() - started) * 1000)
-            return SplitResult(stdout, stderr, duration_ms, output_files)
-        finally:
-            if not self._settings.split_keep_workdir:
-                await anyio.to_thread.run_sync(shutil.rmtree, work_dir, True)
+            await process.wait()
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise GenerationError(
+                f"BS-RoFormer 拆轨超时（{self._settings.bs_roformer_timeout_seconds:g} 秒）。"
+            ) from exc
+        stdout = stdout.decode("utf-8", errors="replace").strip()
+        stderr = stderr.decode("utf-8", errors="replace").strip()
+        if process.returncode != 0:
+            raise GenerationError(
+                f"{label}失败，退出码：{process.returncode}，stderr={stderr[-4000:]}"
+            )
+        return stdout, stderr
+
+    async def split(self, input_path: Path, output_dir: Path) -> SplitResult:
+        require_readable_file(input_path, "拆轨输入音频不可读")
+        require_bs_roformer_runtime(self._settings.bs_roformer_device)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        # static-ffmpeg may download binaries on first use; keep that off the event loop.
+        environment = await asyncio.to_thread(prepare_ffmpeg_environment)
+        environment["PYTHONUNBUFFERED"] = "1"
+        started = asyncio.get_running_loop().time()
+        deadline = started + self._settings.bs_roformer_timeout_seconds
+        # New files keep a failed/cancelled rebuild from overwriting the current project.
+        output_files = stem_output_files(Path(f"{input_path.stem[:120]}_{uuid4().hex[:12]}.wav"))
+        with tempfile.TemporaryDirectory(prefix=".bs-roformer-", dir=output_dir) as temporary:
+            work_dir = Path(temporary)
+            input_dir = work_dir / "input"
+            input_dir.mkdir()
+            prepared = input_dir / "source.wav"
+            await self._run(
+                [
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-nostdin",
+                    "-y",
+                    "-i",
+                    str(input_path),
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    str(BS_ROFORMER_SAMPLE_RATE),
+                    "-c:a",
+                    "pcm_s16le",
+                    "-f",
+                    "wav",
+                    str(prepared),
+                ],
+                environment,
+                deadline,
+                "分轨输入音频解码",
+            )
+            require_readable_file(prepared, "分轨输入音频解码结果为空")
+            with wave.open(str(prepared), "rb") as audio:
+                frames = audio.getnframes()
+            if frames <= 0:
+                raise GenerationError("分轨输入音频没有可播放的内容。")
+            stdout, stderr = await self._run(
+                build_bs_roformer_command(self._settings, input_dir, work_dir),
+                environment,
+                deadline,
+                "BS-RoFormer 六轨分离",
+            )
+            # No await during publication: cancellation cannot leave half a set of stems.
+            publish_stems(work_dir, output_dir, output_files, frames)
+        return SplitResult(
+            stdout, stderr, int((asyncio.get_running_loop().time() - started) * 1000), output_files
+        )

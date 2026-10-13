@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from app.services.voice import MIX_FILTER, RVCConversionError, mix_tracks
+from app.services.voice import RVCConversionError, build_mix_filter, mix_tracks
 
 RATE = 44_100
 SECONDS = 2.0
@@ -85,7 +85,15 @@ def build_premix(inputs: list[Path], output_path: Path) -> Path:
     for path in inputs:
         command.extend(("-i", str(path)))
     command.extend(
-        ("-filter_complex", MIX_FILTER, "-map", "[premix]", "-c:a", "pcm_f32le", str(output_path))
+        (
+            "-filter_complex",
+            build_mix_filter(4),
+            "-map",
+            "[premix]",
+            "-c:a",
+            "pcm_f32le",
+            str(output_path),
+        )
     )
     subprocess.run(command, check=True)
     return output_path
@@ -258,19 +266,34 @@ async def test_all_silent_inputs_fail_instead_of_mixing_at_zero_gain(tmp_path):
 
 
 def test_mix_filter_input_count_matches_the_stem_list():
-    """滤镜图的路数写死 inputs=4（原版实现），分轨名单却来自 STEM_NAMES。
-
-    两者一旦不同步，路由会多传一路输入而 ffmpeg 只用前四路、静默漏轨，所以这里把它们
-    钉在一起：改动 STEM_NAMES 必须同时面对这个断言。
-    """
-    from app.main import MIX_BACKING_STEMS
+    """六轨不能静默漏掉新增伴奏；旧四轨滤镜仍可兼容。"""
     from app.services.stems import STEM_NAMES
 
-    declared = int(re.search(r"amix=inputs=(\d+)", MIX_FILTER).group(1))
-    labels = {int(match) for match in re.findall(r"\[(\d+):a\]", MIX_FILTER)}
+    mix_filter = build_mix_filter(len(STEM_NAMES))
+    declared = int(re.search(r"amix=inputs=(\d+)", mix_filter).group(1))
+    labels = {int(match) for match in re.findall(r"\[(\d+):a\]", mix_filter)}
 
-    assert declared == len(labels) == 1 + len(MIX_BACKING_STEMS)
-    assert len(STEM_NAMES) == 1 + len(MIX_BACKING_STEMS)
+    assert declared == len(labels) == len(STEM_NAMES)
+
+
+async def test_legacy_mix_keeps_guitar_and_piano_audible(tmp_path, tracks):
+    inputs, master = tracks
+    inputs += [write_wav(tmp_path / "guitar.wav", 770), write_wav(tmp_path / "piano.wav", 990)]
+    output = tmp_path / "six-track-mix.wav"
+    await mix_tracks(inputs, master, output, 120)
+    # Removing either extra input must change the actual rendered signal.
+    import numpy as np
+
+    decoded = subprocess.run(
+        ["ffmpeg", "-v", "error", "-i", str(output), "-ac", "1", "-f", "f32le", "-"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    samples = np.frombuffer(decoded, dtype="<f4")
+    spectrum = abs(np.fft.rfft(samples))
+    for frequency in (770, 990):
+        bin_index = round(frequency * len(samples) / RATE)
+        assert spectrum[bin_index] > 100
 
 
 def test_mix_filter_keeps_stereo_when_rvc_vocal_is_mono(tmp_path):
