@@ -11,8 +11,9 @@ import re
 import shutil
 import stat
 import tempfile
+import unicodedata
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -124,9 +125,6 @@ SPLIT_COMPLETE_PROGRESS = 100
 MIX_PROGRESS = 76
 MIX_PREVIEW_PROGRESS = 95
 MIX_INPUT_SUFFIXES = frozenset({".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".webm"})
-# 兼容旧四轨歌曲，新歌曲额外包含 guitar / piano。
-MIX_VOCAL_STEM = "vocal"
-MIX_BACKING_STEMS = tuple(name for name in STEM_NAMES if name != MIX_VOCAL_STEM)
 REPLACE_COMPLETE_PROGRESS = 100
 # 替换已经进入终态（超时/取消），但 RVC 推理线程还没退出、因而仍占着一个生成并发额度的数量。
 # 额度按设计等到线程真正退出才释放，这里只把它暴露出来，让 /api/health 与日志能发现卡住的替换。
@@ -1305,10 +1303,29 @@ def create_app(
                     },
                     progress=waveform_progress,
                 )
-                result["stems"] = stems
-                result.pop("stemNames", None)
+                # 用户上传的录音（stemNames 里有显示名的音轨）不是模型产物，重新分轨时原样保留。
+                previous_stems = result.get("stems")
+                if not isinstance(previous_stems, dict):
+                    previous_stems = {}
+                previous_names = result.get("stemNames") or {}
+                recordings = {
+                    name: url
+                    for name, url in previous_stems.items()
+                    if name in previous_names and name not in stems
+                }
+                result["stems"] = {**stems, **recordings}
+                if recordings:
+                    result["stemNames"] = {name: previous_names[name] for name in recordings}
+                else:
+                    result.pop("stemNames", None)
                 playback = _playback_dict(result)
-                playback.pop("stems", None)
+                recording_previews = {
+                    name: preview
+                    for name, preview in (playback.pop("stems", None) or {}).items()
+                    if name in recordings
+                }
+                if recording_previews:
+                    playback["stems"] = dict(recording_previews)
                 if variant == "original":
                     job.deleted_replaced_vocals.pop(str(song), None)
                 playback.pop("replacedVocal", None)
@@ -1320,9 +1337,15 @@ def create_app(
                 drop_editor_state(result)
                 result["audioRevision"] = result.get("audioRevision", 0) + 1
                 invalidate_mix_artifact(job, result)
-                result["stemUrls"] = list(stems.values())
+                result["stemUrls"] = list(result["stems"].values())
                 previous_waveforms = result.get("waveforms")
                 merged_waveforms = dict(fresh_waveforms)
+                if isinstance(previous_waveforms, dict):
+                    merged_waveforms.update(
+                        (name, previous_waveforms[name])
+                        for name in recordings
+                        if name in previous_waveforms
+                    )
                 if (
                     "full" not in merged_waveforms
                     and isinstance(previous_waveforms, dict)
@@ -1347,6 +1370,14 @@ def create_app(
                 }
                 job.save(application_settings.output_dir)
                 wav_ready = True
+                # 新分轨文件名带随机后缀，旧分轨、旧试听和已清理的删除记录不再被任何工程引用。
+                stale_paths = _referenced_output_paths(
+                    [previous_result, previous_deleted_stems], application_settings
+                ) - _referenced_output_paths(
+                    [job.result, job.deleted_stems, job.deleted_replaced_vocals],
+                    application_settings,
+                )
+                await asyncio.to_thread(_unlink_paths, stale_paths)
                 await active_orchestrator.capacity.release()
                 capacity_released = True
                 job.split_stage = "preview"
@@ -1391,12 +1422,15 @@ def create_app(
                         if isinstance(preview, str) and preview
                     }
                     if previews:
-                        playback["stems"] = previews
+                        playback["stems"] = {**recording_previews, **previews}
                         job.save(application_settings.output_dir)
                 except asyncio.CancelledError:
                     # PATCH 在 preview 阶段只取消编码器（见 README 状态契约）：WAV 分轨保留，
                     # 任务照常按 succeeded 收尾，不把取消写成终态。
-                    playback.pop("stems", None)
+                    if recording_previews:
+                        playback["stems"] = dict(recording_previews)
+                    else:
+                        playback.pop("stems", None)
                     logger.info("stem previews cancelled job_id=%s song=%s", job_id, song)
                 _mark_split_succeeded(job)
             except asyncio.CancelledError:
@@ -1420,16 +1454,8 @@ def create_app(
                     result.update(previous_result)
                     job.deleted_stems = previous_deleted_stems
                     job.deleted_replaced_vocals = previous_deleted_vocals
-                    previous_paths = {
-                        _output_path_from_url(value, application_settings)
-                        for value in previous_result.get("stems", {}).values()
-                    }
-                    for path in generated_paths:
-                        if path not in previous_paths:
-                            try:
-                                path.unlink(missing_ok=True)
-                            except OSError:
-                                logger.warning("failed split output cleanup skipped", exc_info=True)
+                    previous_paths = _referenced_output_paths(previous_result, application_settings)
+                    _unlink_paths({path.resolve() for path in generated_paths} - previous_paths)
                 if not capacity_released:
                     await active_orchestrator.capacity.release()
                 publish()
@@ -2300,8 +2326,9 @@ def create_app(
         created: list[Path] = []
         try:
             name = name.strip()
-            if not name or re.search(r"[\x00-\x1f\x7f]", name):
-                return error(400, "录音名称须为 1–100 个字符，不能包含控制字符。")
+            # Cc 控制字符与 Cf 格式字符（双向覆盖、零宽字符）都会让显示名伪装成别的内容。
+            if not name or any(unicodedata.category(char) in {"Cc", "Cf"} for char in name):
+                return error(400, "录音名称须为 1–100 个字符，不能包含控制字符或不可见格式字符。")
             selected = current_project()
             if isinstance(selected, JSONResponse):
                 return selected
@@ -3478,6 +3505,30 @@ def _public_audio_url(audio_url: str, base_url: str, settings: Settings) -> str:
 
 def _output_path_from_url(audio_url: str, settings: Settings):
     return output_path_from_url(audio_url, settings.output_dir)
+
+
+def _referenced_output_paths(value: Any, settings: Settings) -> set[Path]:
+    """Collect every output audio file referenced anywhere inside a job structure."""
+    found: set[Path] = set()
+    pending = [value]
+    while pending:
+        item = pending.pop()
+        if isinstance(item, dict):
+            pending.extend(item.values())
+        elif isinstance(item, list):
+            pending.extend(entry for entry in item if isinstance(entry, (dict, list, str)))
+        elif isinstance(item, str) and item.lower().endswith(tuple(MIX_INPUT_SUFFIXES)):
+            with suppress(ValueError):
+                found.add(_output_path_from_url(item, settings))
+    return found
+
+
+def _unlink_paths(paths: set[Path]) -> None:
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("stale audio cleanup skipped path=%s", path, exc_info=True)
 
 
 def _stem_trash_path(target, settings: Settings, job_id: str, song: int = 0):

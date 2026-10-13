@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from app.services.voice import MIX_FILTER, RVCConversionError, build_mix_filter, mix_tracks
+from app.services.voice import RVCConversionError, build_mix_filter, mix_tracks
 
 RATE = 44_100
 SECONDS = 2.0
@@ -85,7 +85,15 @@ def build_premix(inputs: list[Path], output_path: Path) -> Path:
     for path in inputs:
         command.extend(("-i", str(path)))
     command.extend(
-        ("-filter_complex", MIX_FILTER, "-map", "[premix]", "-c:a", "pcm_f32le", str(output_path))
+        (
+            "-filter_complex",
+            build_mix_filter(4),
+            "-map",
+            "[premix]",
+            "-c:a",
+            "pcm_f32le",
+            str(output_path),
+        )
     )
     subprocess.run(command, check=True)
     return output_path
@@ -259,15 +267,13 @@ async def test_all_silent_inputs_fail_instead_of_mixing_at_zero_gain(tmp_path):
 
 def test_mix_filter_input_count_matches_the_stem_list():
     """六轨不能静默漏掉新增伴奏；旧四轨滤镜仍可兼容。"""
-    from app.main import MIX_BACKING_STEMS
     from app.services.stems import STEM_NAMES
 
     mix_filter = build_mix_filter(len(STEM_NAMES))
     declared = int(re.search(r"amix=inputs=(\d+)", mix_filter).group(1))
     labels = {int(match) for match in re.findall(r"\[(\d+):a\]", mix_filter)}
 
-    assert declared == len(labels) == 1 + len(MIX_BACKING_STEMS)
-    assert len(STEM_NAMES) == 1 + len(MIX_BACKING_STEMS)
+    assert declared == len(labels) == len(STEM_NAMES)
 
 
 async def test_legacy_mix_keeps_guitar_and_piano_audible(tmp_path, tracks):

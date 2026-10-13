@@ -109,6 +109,8 @@ async def test_browser_recording_formats_are_decoded(tmp_path, format, codec):
     [
         (" ", b"audio", 400),
         ("名字\x00", b"audio", 400),
+        ("名字\u202e", b"audio", 400),
+        ("名\u200b字", b"audio", 400),
         ("录音", b"", 400),
         ("录音", b"not audio", 400),
         ("录音", b"a" * (1024 * 1024 + 1), 413),

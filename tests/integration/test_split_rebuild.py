@@ -68,7 +68,8 @@ async def test_force_rebuild_replaces_old_draft_and_keeps_other_candidate(tmp_pa
         assert rebuilt["debug"]["splitterModel"] == BS_ROFORMER_MODEL
         assert target["fullTrack"] == old_master
         assert not set(target["stems"].values()) & set(old_stems.values())
-        assert all((settings.output_dir / value).exists() for value in old_stems.values())
+        # 旧分轨不再被任何工程引用，成功重建后即被清理。
+        assert not any((settings.output_dir / value).exists() for value in old_stems.values())
         assert {
             key: value for key, value in job.result.items() if key != "alternatives"
         } == original
@@ -107,6 +108,39 @@ async def test_mixed_variant_splits_only_the_selected_project(tmp_path, monkeypa
     assert set(detail["result"]["mixed"]["stems"]) == set(STEM_NAMES)
     assert detail["result"]["mixed"]["audioRevision"] == 1
     assert separator.await_args.args[0] == master
+
+
+async def test_force_rebuild_keeps_uploaded_recordings(tmp_path, monkeypatch):
+    app, settings, job, separator = rebuild_app(tmp_path, monkeypatch)
+    target = job.result["alternatives"][0]
+    song_dir = settings.output_dir / "jobs" / job.job_id / "song_2"
+    recording = song_dir / "recording_take.wav"
+    preview = song_dir / "playtrack" / "recording_take.mp3"
+    sine_wav(recording, 0.1)
+    preview.parent.mkdir(exist_ok=True)
+    preview.write_bytes(b"mp3")
+    recording_url = recording.relative_to(settings.output_dir).as_posix()
+    preview_url = preview.relative_to(settings.output_dir).as_posix()
+    target["stems"]["recording_take"] = recording_url
+    target["stemUrls"] = list(target["stems"].values())
+    target["stemNames"] = {"recording_take": "我的和声"}
+    target.setdefault("waveforms", {})["recording_take"] = [0.75]
+    target.setdefault("playback", {})["stems"] = {"recording_take": preview_url}
+    async with client(app) as http:
+        accepted = await http.post(
+            f"/api/jobs/{job.job_id}/split?song=1&force=true",
+            headers={"X-Audio-Revision": "0"},
+        )
+        assert accepted.status_code == 202
+        await job.split_task
+    assert job.split_status == "succeeded"
+    assert set(target["stems"]) == {*STEM_NAMES, "recording_take"}
+    assert target["stems"]["recording_take"] == recording_url
+    assert target["stemNames"] == {"recording_take": "我的和声"}
+    assert target["waveforms"]["recording_take"] == [0.75]
+    assert target["playback"]["stems"] == {"recording_take": preview_url}
+    assert target["stemUrls"] == list(target["stems"].values())
+    assert recording.exists() and preview.exists()
 
 
 @pytest.mark.parametrize("failure", ["model", "save", "cancel"])

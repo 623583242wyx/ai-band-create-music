@@ -38,7 +38,6 @@ def build_mix_filter(input_count: int) -> str:
     )
 
 
-MIX_FILTER = build_mix_filter(4)
 LIMIT_FILTER = (
     "volume={gain_db:.3f}dB,alimiter=limit=0.891251:attack=5:release=50:level=false:latency=true"
 )

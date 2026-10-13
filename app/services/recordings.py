@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import wave
 from pathlib import Path
 
@@ -37,7 +38,7 @@ async def prepare_recording_audio(source: Path, target: Path, max_seconds: int) 
             "wav",
             str(target),
         ],
-        prepare_ffmpeg_environment(),
+        await asyncio.to_thread(prepare_ffmpeg_environment),
         "无法解析录音，请上传有效音频文件（WebM、MP4/M4A、WAV、MP3、OGG 等）。",
     )
     with wave.open(str(target), "rb") as audio:

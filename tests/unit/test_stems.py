@@ -158,15 +158,11 @@ def test_incomplete_model_output_cannot_publish_partial_stems(tmp_path, bad_outp
     assert {p.name: p.read_bytes() for p in output.iterdir()} == {files["vocal"]: b"previous vocal"}
 
 
-@pytest.mark.parametrize("has_previous", [False, True])
-def test_publication_failure_rolls_back_the_whole_set(tmp_path, monkeypatch, has_previous):
+def test_publication_failure_rolls_back_the_whole_set(tmp_path, monkeypatch):
     work, output = tmp_path / "work", tmp_path / "output"
     model_outputs(work)
     output.mkdir()
     files = stem_output_files(Path("demo.wav"))
-    previous = {filename: name.encode() for name, filename in files.items()} if has_previous else {}
-    for name, content in previous.items():
-        (output / name).write_bytes(content)
     replace = Path.replace
 
     def fail_guitar(path, target):
@@ -177,7 +173,7 @@ def test_publication_failure_rolls_back_the_whole_set(tmp_path, monkeypatch, has
     monkeypatch.setattr(Path, "replace", fail_guitar)
     with pytest.raises(OSError):
         publish_stems(work, output, files, 4410)
-    assert {p.name: p.read_bytes() for p in output.iterdir()} == previous
+    assert list(output.iterdir()) == []
 
 
 async def test_input_is_resampled_and_model_workdir_is_isolated(tmp_path, monkeypatch):

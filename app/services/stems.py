@@ -103,7 +103,7 @@ def stem_output_files(input_path: Path) -> dict[str, str]:
 def publish_stems(
     work_dir: Path, output_dir: Path, output_files: dict[str, str], expected_frames: int
 ) -> None:
-    """Validate all six outputs before replacing files; restore prior files on failure."""
+    """Validate all six outputs, then move them to fresh (uuid-named) targets."""
     import soundfile as sf
 
     sources = {
@@ -124,22 +124,15 @@ def publish_stems(
             or audio.frames <= 0
         ):
             raise GenerationError(f"BS-RoFormer 输出的格式或时长不匹配：{source.name}")
-    backups: dict[Path, Path] = {}
     published: list[Path] = []
     try:
         for name, source in sources.items():
             target = output_dir / output_files[name]
-            if target.exists():
-                backup = work_dir / f"previous_{name}.wav"
-                target.replace(backup)
-                backups[target] = backup
             source.replace(target)
             published.append(target)
     except BaseException:
         for target in published:
             target.unlink(missing_ok=True)
-        for target, backup in backups.items():
-            backup.replace(target)
         raise
 
 
@@ -185,7 +178,8 @@ class BSRoFormerStemSeparator:
         require_readable_file(input_path, "拆轨输入音频不可读")
         require_bs_roformer_runtime(self._settings.bs_roformer_device)
         output_dir.mkdir(parents=True, exist_ok=True)
-        environment = prepare_ffmpeg_environment()
+        # static-ffmpeg may download binaries on first use; keep that off the event loop.
+        environment = await asyncio.to_thread(prepare_ffmpeg_environment)
         environment["PYTHONUNBUFFERED"] = "1"
         started = asyncio.get_running_loop().time()
         deadline = started + self._settings.bs_roformer_timeout_seconds
