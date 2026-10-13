@@ -2326,8 +2326,12 @@ def create_app(
         created: list[Path] = []
         try:
             name = name.strip()
-            # Cc 控制字符与 Cf 格式字符（双向覆盖、零宽字符）都会让显示名伪装成别的内容。
-            if not name or any(unicodedata.category(char) in {"Cc", "Cf"} for char in name):
+            # Cc 控制字符与 Cf 格式字符（双向覆盖、零宽空格）都会让显示名伪装成别的内容；
+            # ZWNJ/ZWJ 是波斯语、印度系文字与组合 emoji 的正常组成部分，予以放行。
+            if not name or any(
+                unicodedata.category(char) in {"Cc", "Cf"} and char not in "\u200c\u200d"
+                for char in name
+            ):
                 return error(400, "录音名称须为 1–100 个字符，不能包含控制字符或不可见格式字符。")
             selected = current_project()
             if isinstance(selected, JSONResponse):
