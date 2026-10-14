@@ -1200,7 +1200,13 @@ class MurekaMusicProvider:
             while True:
                 status_name = str(task.get("status") or "")
                 if progress:
-                    await progress("generating_music", None, None)
+                    await progress(
+                        "generating_music"
+                        if status_name in {"running", "succeeded"}
+                        else "waiting_music",
+                        None,
+                        None,
+                    )
                 if status_name == "succeeded":
                     break
                 if status_name in {"failed", "timeouted", "cancelled"}:

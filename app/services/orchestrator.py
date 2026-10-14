@@ -5,6 +5,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -261,10 +262,16 @@ class GenerationOrchestrator:
                 song_state.update(
                     status="running", progress=0 if task_progress is not None else None
                 )
+                if selected_provider == "mureka_music":
+                    song_state["generationStartedAt"] = datetime.now(timezone.utc).isoformat()
                 await report(
-                    "generating_music",
+                    "waiting_music" if selected_provider == "mureka_music" else "generating_music",
                     task_progress,
-                    f"音乐模型正在生成第 {song_number}/{effective_count} 首",
+                    (
+                        f"第 {song_number}/{effective_count} 首：等待 Mureka 返回进度"
+                        if selected_provider == "mureka_music"
+                        else f"音乐模型正在生成第 {song_number}/{effective_count} 首"
+                    ),
                     structured_prompt=structured_prompt,
                     lyrics=lyrics,
                     title=song_title,
@@ -284,6 +291,13 @@ class GenerationOrchestrator:
                     message = f"音乐模型正在生成第 {song_number}/{effective_count} 首"
                     if selected_provider == "elevenlabs_music":
                         message = f"第 {song_number}/{effective_count} 首：等待 ElevenLabs 返回音频"
+                    if selected_provider == "mureka_music":
+                        detail = (
+                            "等待 Mureka 返回进度"
+                            if stage == "waiting_music"
+                            else "Mureka 正在生成，总时长待确定"
+                        )
+                        message = f"第 {song_number}/{effective_count} 首：{detail}"
                     if received_audio_seconds is not None:
                         message = (
                             f"第 {song_number}/{effective_count} 首："

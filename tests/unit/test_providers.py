@@ -830,14 +830,29 @@ async def test_mureka_uploads_reference_once_polls_and_downloads_wav(tmp_path: P
     reference = AudioReference("ref1", 30000, "")
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         provider = MurekaMusicProvider(settings, client)
+        reports = []
+
+        async def progress(stage, step, total_steps):
+            reports.append((stage, step, total_steps))
+
         result = await provider.generate(
-            "x" * 2000, 120, MINIMAX_USER_PROMPT, job_id="job_1", reference=reference
+            "x" * 2000,
+            120,
+            MINIMAX_USER_PROMPT,
+            job_id="job_1",
+            reference=reference,
+            progress=progress,
         )
         polls["count"] = 0
         await provider.generate(
             "rock", None, MINIMAX_USER_PROMPT, variation=1, job_id="job_1", reference=reference
         )
 
+    assert reports == [
+        ("waiting_music", None, None),
+        ("generating_music", None, None),
+        ("generating_music", None, None),
+    ]
     assert result.audio_path.read_bytes() == b"wav-bytes"
     assert result.audio_path.suffix == ".wav"
     assert result.debug["durationSeconds"] == 61

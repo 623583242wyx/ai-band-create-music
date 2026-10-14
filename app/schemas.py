@@ -160,6 +160,7 @@ class UpdateGenerationJobRequest(BaseModel):
 
 
 class SongGenerationState(BaseModel):
+    generationStartedAt: str | None = Field(default=None, exclude_if=lambda value: value is None)
     songNumber: int = Field(ge=1, le=2)
     status: Literal["pending", "running", "succeeded", "failed", "cancelled"]
     stage: str
