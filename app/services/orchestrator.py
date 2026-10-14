@@ -5,6 +5,7 @@ import logging
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any, Protocol
 from uuid import uuid4
 
@@ -108,10 +109,14 @@ class GenerationOrchestrator:
     ) -> dict[str, Any]:
         job_id = job_id or f"job_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
         selected_provider = provider or self.settings.music_provider
-        effective_duration_minutes = (
-            None if selected_provider == "minimax_music" else duration_minutes
+        # MiniMax and Mureka choose the song length themselves; requested durations are ignored.
+        provider_sets_duration = selected_provider in {"minimax_music", "mureka_music"}
+        effective_duration_minutes = None if provider_sets_duration else duration_minutes
+        effective_count = (
+            count
+            if selected_provider in {"minimax_music", "elevenlabs_music", "mureka_music"}
+            else 1
         )
-        effective_count = count if selected_provider in {"minimax_music", "elevenlabs_music"} else 1
         current_song = None
         latest_result = None
         song_states = [
@@ -197,6 +202,7 @@ class GenerationOrchestrator:
             if duration_seconds is None and selected_provider not in {
                 "minimax_music",
                 "elevenlabs_music",
+                "mureka_music",
             }:
                 duration_seconds = self.settings.default_duration_minutes * 60
             provider_prompt = f"[歌词与创作内容]\n{lyrics}"
@@ -205,9 +211,9 @@ class GenerationOrchestrator:
             duration_diagnostics: dict[str, object] = {
                 "durationSource": (
                     "provider_override"
-                    if selected_provider == "minimax_music" and duration_minutes is not None
+                    if provider_sets_duration and duration_minutes is not None
                     else "provider"
-                    if selected_provider in {"minimax_music", "elevenlabs_music"}
+                    if selected_provider in {"minimax_music", "elevenlabs_music", "mureka_music"}
                     and duration_seconds is None
                     else "user"
                     if duration_minutes is not None
@@ -256,10 +262,16 @@ class GenerationOrchestrator:
                 song_state.update(
                     status="running", progress=0 if task_progress is not None else None
                 )
+                if selected_provider == "mureka_music":
+                    song_state["generationStartedAt"] = datetime.now(timezone.utc).isoformat()
                 await report(
-                    "generating_music",
+                    "waiting_music" if selected_provider == "mureka_music" else "generating_music",
                     task_progress,
-                    f"音乐模型正在生成第 {song_number}/{effective_count} 首",
+                    (
+                        f"第 {song_number}/{effective_count} 首：等待 Mureka 返回进度"
+                        if selected_provider == "mureka_music"
+                        else f"音乐模型正在生成第 {song_number}/{effective_count} 首"
+                    ),
                     structured_prompt=structured_prompt,
                     lyrics=lyrics,
                     title=song_title,
@@ -279,6 +291,13 @@ class GenerationOrchestrator:
                     message = f"音乐模型正在生成第 {song_number}/{effective_count} 首"
                     if selected_provider == "elevenlabs_music":
                         message = f"第 {song_number}/{effective_count} 首：等待 ElevenLabs 返回音频"
+                    if selected_provider == "mureka_music":
+                        detail = (
+                            "等待 Mureka 返回进度"
+                            if stage == "waiting_music"
+                            else "Mureka 正在生成，总时长待确定"
+                        )
+                        message = f"第 {song_number}/{effective_count} 首：{detail}"
                     if received_audio_seconds is not None:
                         message = (
                             f"第 {song_number}/{effective_count} 首："
@@ -312,7 +331,7 @@ class GenerationOrchestrator:
                         variation=index,
                         progress=provider_progress,
                         job_id=job_id,
-                        # Only ElevenLabs accepts a reference; callers validate the provider.
+                        # Only ElevenLabs and Mureka accept a reference; callers validate it.
                         **({"reference": reference} if reference is not None else {}),
                     )
                     if task_progress is not None:

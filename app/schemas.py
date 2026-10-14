@@ -74,9 +74,9 @@ class GenerateRequest(BaseModel):
     durationSeconds: int | None = Field(default=None, ge=10, le=360)
     # Display name chosen in the group chat; shown by the history page instead of the lyrics.
     title: str | None = Field(default=None, max_length=100)
-    provider: Literal["minimax_music", "elevenlabs_music"] | None = None
+    provider: Literal["minimax_music", "elevenlabs_music", "mureka_music"] | None = None
     count: Literal[1, 2] = 1
-    # ID returned by POST /api/references; ElevenLabs only.
+    # ID returned by POST /api/references; ElevenLabs and Mureka only.
     referenceId: str | None = Field(default=None, pattern=REFERENCE_ID_PATTERN)
 
     @field_validator("title")
@@ -160,6 +160,7 @@ class UpdateGenerationJobRequest(BaseModel):
 
 
 class SongGenerationState(BaseModel):
+    generationStartedAt: str | None = Field(default=None, exclude_if=lambda value: value is None)
     songNumber: int = Field(ge=1, le=2)
     status: Literal["pending", "running", "succeeded", "failed", "cancelled"]
     stage: str

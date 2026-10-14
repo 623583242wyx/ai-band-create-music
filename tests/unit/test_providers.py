@@ -12,15 +12,18 @@ import pytest
 
 from app.core.errors import GenerationError, ProviderGlobalError
 from app.services.providers import (
+    AudioReference,
     ElevenLabsMusicProvider,
     GenericMusicProvider,
     MiniMaxMusicProvider,
+    MurekaMusicProvider,
     _wrap_long_lyric_lines,
     create_music_provider,
     extract_generated_audio_url,
     extract_suno_audio_url,
     extract_task_id,
 )
+from app.services.references import new_reference_entry, references_dir, save_references
 from tests.helpers import make_settings
 
 
@@ -780,3 +783,136 @@ def minimax_response(request):
     return httpx.Response(
         200, json={"status": "succeeded", "stage": "completed", "step": None, "totalSteps": None}
     )
+
+
+async def test_mureka_uploads_reference_once_polls_and_downloads_wav(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, mureka_api_key="test", music_poll_interval_seconds=0)
+    directory = references_dir(settings.output_dir)
+    directory.mkdir(parents=True)
+    (directory / "clip.mp3").write_bytes(b"mp3")
+    save_references(settings.output_dir, [new_reference_entry("ref1", "a.mp3", 30, "clip.mp3")])
+    requests: list[httpx.Request] = []
+    polls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if request.url.host == "api.mureka.ai":
+            assert request.headers["Authorization"] == "Bearer test"
+        if path == "/v1/files/upload":
+            assert b'name="purpose"' in request.content and b"reference" in request.content
+            return httpx.Response(200, json={"id": "file-1"})
+        if path == "/v1/song/generate":
+            return httpx.Response(200, json={"id": "task-1", "status": "preparing"})
+        if path == "/v1/song/query/task-1":
+            polls["count"] += 1
+            if polls["count"] == 1:
+                return httpx.Response(200, json={"id": "task-1", "status": "running"})
+            return httpx.Response(
+                200,
+                json={
+                    "id": "task-1",
+                    "status": "succeeded",
+                    "model": "mureka-9.5",
+                    "choices": [
+                        {
+                            "id": "song-1",
+                            "url": "https://cdn.test/a.mp3",
+                            "wav_url": "https://cdn.test/a.wav",
+                            "duration": 61000,
+                        }
+                    ],
+                },
+            )
+        assert str(request.url) == "https://cdn.test/a.wav"
+        return httpx.Response(200, content=b"wav-bytes")
+
+    reference = AudioReference("ref1", 30000, "")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        provider = MurekaMusicProvider(settings, client)
+        reports = []
+
+        async def progress(stage, step, total_steps):
+            reports.append((stage, step, total_steps))
+
+        result = await provider.generate(
+            "x" * 2000,
+            120,
+            MINIMAX_USER_PROMPT,
+            job_id="job_1",
+            reference=reference,
+            progress=progress,
+        )
+        polls["count"] = 0
+        await provider.generate(
+            "rock", None, MINIMAX_USER_PROMPT, variation=1, job_id="job_1", reference=reference
+        )
+
+    assert reports == [
+        ("waiting_music", None, None),
+        ("generating_music", None, None),
+        ("generating_music", None, None),
+    ]
+    assert result.audio_path.read_bytes() == b"wav-bytes"
+    assert result.audio_path.suffix == ".wav"
+    assert result.debug["durationSeconds"] == 61
+    paths = [request.url.path for request in requests]
+    assert paths.count("/v1/files/upload") == 1
+    body = json.loads(next(r for r in requests if r.url.path == "/v1/song/generate").content)
+    assert body == {
+        "lyrics": "[Verse]\ntest lyrics",
+        "model": "mureka-9.5",
+        "prompt": "x" * 1024,
+        "n": 1,
+        "reference_id": "file-1",
+    }
+
+
+@pytest.mark.parametrize("status", [401, 429, 500])
+async def test_mureka_classifies_http_errors(tmp_path: Path, status: int) -> None:
+    settings = make_settings(tmp_path, mureka_api_key="test")
+    handler = lambda request: httpx.Response(status, json={"error": {"message": "no"}})  # noqa: E731
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError) as caught:
+            await MurekaMusicProvider(settings, client).generate("rock", None, MINIMAX_USER_PROMPT)
+    assert isinstance(caught.value, ProviderGlobalError) == (status in {401, 429})
+
+
+async def test_mureka_failed_task_reports_reason(tmp_path: Path) -> None:
+    settings = make_settings(tmp_path, mureka_api_key="test")
+    handler = lambda request: httpx.Response(  # noqa: E731
+        200, json={"id": "t", "status": "failed", "failed_reason": "content policy"}
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match="content policy"):
+            await MurekaMusicProvider(settings, client).generate("rock", None, MINIMAX_USER_PROMPT)
+
+
+async def test_mureka_loops_short_reference_to_30_seconds(tmp_path: Path) -> None:
+    from app.services.references import prepare_reference_audio, reference_audio_name
+
+    settings = make_settings(tmp_path, mureka_api_key="test")
+    source = tmp_path / "short.wav"
+    source.write_bytes(wav_bytes(5))
+    clip = references_dir(settings.output_dir) / reference_audio_name()
+    duration = await prepare_reference_audio(source, clip)
+    save_references(
+        settings.output_dir, [new_reference_entry("ref5", "s.wav", duration, clip.name)]
+    )
+    uploads: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/files/upload":
+            uploads.append(len(request.content))
+            return httpx.Response(200, json={"id": "file-5"})
+        return httpx.Response(200, json={"id": "t", "status": "failed", "failed_reason": "stop"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match="stop"):
+            await MurekaMusicProvider(settings, client).generate(
+                "rock", None, MINIMAX_USER_PROMPT, reference=AudioReference("ref5", 5000, "")
+            )
+
+    # 30 s at 192 kbps is about 720 kB; the original 5 s clip is about 120 kB.
+    assert len(uploads) == 1 and uploads[0] > 600_000
+    assert sorted(path.name for path in clip.parent.iterdir()) == sorted([clip.name, "index.json"])

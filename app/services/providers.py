@@ -22,6 +22,13 @@ from app.services.prompt import (
     _http_failure_message,
     split_generation_prompt,
 )
+from app.services.references import (
+    REFERENCE_MAX_SECONDS,
+    find_reference,
+    loop_reference_audio,
+    reference_audio_name,
+    references_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +53,9 @@ ELEVENLABS_AUTO_MIN_DURATION_SECONDS = 3
 ELEVENLABS_REFERENCE_MODELS = frozenset({"music_v2", "music_v2_5"})
 ELEVENLABS_PCM_CHANNELS = 2
 ELEVENLABS_PCM_SAMPLE_WIDTH = 2
+# https://platform.mureka.ai/docs/api/operations/post-v1-song-generate.html
+MUREKA_LYRICS_MAX_CHARS = 5000
+MUREKA_PROMPT_MAX_CHARS = 1024
 LYRIC_BREAK_PATTERN = re.compile(r"(?<=[，。！？；、,.!?;:：])")
 
 
@@ -1069,6 +1079,206 @@ class MiniMaxMusicProvider:
             ) from exc
 
 
+class MurekaMusicProvider:
+    """Mureka song API: upload reference → /v1/song/generate → poll /v1/song/query/{id}.
+
+    https://platform.mureka.ai/docs/api/operations/post-v1-song-generate.html
+    """
+
+    def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
+        self._settings = settings
+        self._client = client
+        # ponytail: in-memory cache of local reference id → Mureka file id; lost on restart,
+        # then the 30 s clip is simply uploaded again. Persist in the index if uploads get billed.
+        self._reference_files: dict[str, str] = {}
+
+    def _headers(self) -> dict[str, str]:
+        secret = self._settings.mureka_api_key
+        if secret is None:
+            raise ProviderGlobalError("Mureka 音乐生成失败：缺少 MUREKA_API_KEY 环境变量。")
+        return {"Authorization": f"Bearer {secret.get_secret_value()}"}
+
+    async def _reference_file_id(self, reference_id: str) -> str:
+        if cached := self._reference_files.get(reference_id):
+            return cached
+        entry = find_reference(self._settings.output_dir, reference_id)
+        audio = entry.get("audio") if entry else None
+        if not isinstance(audio, str) or not audio:
+            raise GenerationError("参考音频不存在或已删除，请重新选择。")
+        directory = references_dir(self._settings.output_dir)
+        path = directory / Path(audio).name
+        require_readable_file(path, "参考音频文件不可读")
+        # purpose=reference accepts mp3/m4a of exactly 30 s; longer is trimmed by Mureka, shorter
+        # local clips (3–30 s) are looped to 30 s in a temporary file first.
+        looped = None
+        if float(entry["durationSeconds"]) < REFERENCE_MAX_SECONDS:
+            looped = directory / f".mureka-{reference_audio_name()}"
+            await loop_reference_audio(path, looped)
+        try:
+            with (looped or path).open("rb") as handle:
+                response = await self._client.post(
+                    f"{self._settings.mureka_base_url}/v1/files/upload",
+                    data={"purpose": "reference"},
+                    files={"file": (path.name, handle, "audio/mpeg")},
+                    headers=self._headers(),
+                    timeout=self._settings.music_api_timeout_seconds,
+                )
+        finally:
+            if looped is not None:
+                looped.unlink(missing_ok=True)
+        response.raise_for_status()
+        data = response.json()
+        file_id = data.get("id") if isinstance(data, dict) else None
+        if not isinstance(file_id, str) or not file_id:
+            raise GenerationError("Mureka 参考音频上传失败：接口未返回文件 id。")
+        self._reference_files[reference_id] = file_id
+        return file_id
+
+    async def generate(
+        self,
+        structured_prompt: str,
+        duration_seconds: int | None,
+        user_prompt: str,
+        *,
+        variation: int = 0,
+        progress: ProviderProgressCallback | None = None,
+        job_id: str | None = None,
+        reference: AudioReference | None = None,
+    ) -> MusicResult:
+        # Mureka has no length parameter; the song length follows the lyrics (max 5m30s).
+        del duration_seconds
+        lyrics, _ = split_generation_prompt(user_prompt)
+        if not lyrics:
+            raise GenerationError("Mureka 音乐生成失败：缺少已准备好的歌词。")
+        if len(lyrics) > MUREKA_LYRICS_MAX_CHARS:
+            raise GenerationError(
+                f"Mureka 音乐生成失败：歌词长度 {len(lyrics)} 超过接口上限 "
+                f"{MUREKA_LYRICS_MAX_CHARS} 字符。"
+            )
+        base_url = self._settings.mureka_base_url
+        try:
+            request_body: dict[str, Any] = {
+                "lyrics": lyrics,
+                "model": self._settings.mureka_model,
+                # ponytail: the API rejects longer prompts; trimming keeps the head of the
+                # structured style prompt, which carries genre, mood and vocal tags.
+                "prompt": structured_prompt[:MUREKA_PROMPT_MAX_CHARS],
+                # n defaults to 2 and every song is billed; the orchestrator loops per variation.
+                "n": 1,
+            }
+            if reference is not None:
+                # Docs list reference_id + vocal_id and prompt + vocal_id as combinations;
+                # prompt + reference_id is unverified and needs a live check.
+                request_body["reference_id"] = await self._reference_file_id(reference.song_id)
+            url = f"{base_url}/v1/song/generate"
+            request_diagnostic = {"method": "POST", "url": url, "body": request_body}
+            update_provider_diagnostic(
+                self._settings.output_dir,
+                job_id,
+                variation,
+                provider="mureka_music",
+                request=request_diagnostic,
+            )
+            response = await self._client.post(
+                url,
+                json=request_body,
+                headers=self._headers(),
+                timeout=self._settings.music_api_timeout_seconds,
+            )
+            create_response = _response_diagnostic(response)
+            update_provider_diagnostic(
+                self._settings.output_dir, job_id, variation, createResponse=create_response
+            )
+            response.raise_for_status()
+            task = create_response["body"]
+            task_id = task.get("id") if isinstance(task, dict) else None
+            if not isinstance(task_id, str) or not task_id:
+                raise GenerationError("Mureka 音乐生成失败：接口未返回任务 id。")
+
+            query_url = f"{base_url}/v1/song/query/{quote(task_id, safe='')}"
+            started = time.monotonic()
+            while True:
+                status_name = str(task.get("status") or "")
+                if progress:
+                    await progress(
+                        "generating_music"
+                        if status_name in {"running", "succeeded"}
+                        else "waiting_music",
+                        None,
+                        None,
+                    )
+                if status_name == "succeeded":
+                    break
+                if status_name in {"failed", "timeouted", "cancelled"}:
+                    reason = task.get("failed_reason") or status_name
+                    raise GenerationError(f"Mureka 音乐生成失败：{reason}")
+                remaining = self._settings.mureka_timeout_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise GenerationError(f"Mureka 音乐生成任务超时，task_id={task_id}。")
+                await asyncio.sleep(min(self._settings.music_poll_interval_seconds, remaining))
+                response = await self._client.get(
+                    query_url, headers=self._headers(), timeout=min(30, max(remaining, 1))
+                )
+                status_response = _response_diagnostic(response)
+                update_provider_diagnostic(
+                    self._settings.output_dir, job_id, variation, statusResponse=status_response
+                )
+                response.raise_for_status()
+                task = status_response["body"]
+                if not isinstance(task, dict):
+                    raise GenerationError("Mureka 返回的任务状态不是 JSON 对象。")
+
+            choices = task.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices else None
+            if not isinstance(choice, dict):
+                raise GenerationError("Mureka 音乐生成失败：任务成功但未返回歌曲。")
+            # WAV keeps the stem separator input lossless; mp3 `url` is the documented fallback.
+            if choice.get("wav_url"):
+                audio_url, suffix = choice["wav_url"], ".wav"
+            else:
+                audio_url, suffix = choice.get("url"), ".mp3"
+            if not isinstance(audio_url, str) or not audio_url.startswith("https://"):
+                raise GenerationError("Mureka 音乐生成失败：歌曲下载地址无效。")
+            target = _audio_target(
+                self._settings, f"full_song_mureka_{task_id}{suffix}", job_id, variation
+            )
+            path = await download_audio(
+                self._client,
+                audio_url,
+                target,
+                timeout=self._settings.music_download_timeout_seconds,
+                trusted_local_root=PROJECT_ROOT,
+            )
+            duration_ms = choice.get("duration")
+            return MusicResult(
+                path,
+                {
+                    "provider": "mureka_music",
+                    "modelId": task.get("model") or self._settings.mureka_model,
+                    "mode": "polling",
+                    "taskId": task_id,
+                    "songId": choice.get("id"),
+                    **(
+                        {"durationSeconds": duration_ms / 1000}
+                        if isinstance(duration_ms, (int, float))
+                        else {}
+                    ),
+                    **({"audioReferenceId": reference.song_id} if reference is not None else {}),
+                },
+            )
+        except GenerationError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            error_type = (
+                ProviderGlobalError
+                if exc.response.status_code in GLOBAL_PROVIDER_HTTP_STATUSES
+                else GenerationError
+            )
+            raise error_type(f"Mureka 音乐生成失败：{_http_failure_message(exc)}") from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise GenerationError(f"Mureka 音乐生成失败：{_http_failure_message(exc)}") from exc
+
+
 def create_music_provider(
     settings: Settings,
     client: httpx.AsyncClient,
@@ -1089,4 +1299,11 @@ def create_music_provider(
         return SunoMusicProvider(settings, client)
     if selected == "minimax_music":
         return MiniMaxMusicProvider(settings, direct_client or client)
+    if selected == "mureka_music":
+        mureka_client = (
+            direct_client
+            if settings.mureka_bypass_global_proxy and direct_client is not None
+            else client
+        )
+        return MurekaMusicProvider(settings, mureka_client)
     return GenericMusicProvider(settings, client)

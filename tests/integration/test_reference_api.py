@@ -192,3 +192,20 @@ async def test_upload_reports_missing_audio_tools(tmp_path: Path, monkeypatch) -
     assert "ffmpeg" in response.json()["message"]
     assert fake.uploads == []
     assert not list((settings.output_dir / "references").glob("*.mp3"))
+
+
+async def test_mureka_generation_receives_local_reference_id(tmp_path: Path) -> None:
+    app, settings, fake = reference_app(tmp_path)
+    mureka = FakeElevenLabs(settings.mock_full_song_path)
+    app.state.orchestrator.music_providers["mureka_music"] = mureka
+    async with client(app) as http:
+        await http.post(
+            "/api/references", files={"file": ("a.wav", sine_wav(tmp_path / "a.wav", 5))}
+        )
+        ok = await http.post(
+            "/api/generate",
+            json={"prompt": "流行", "provider": "mureka_music", "referenceId": "song_1"},
+        )
+    assert ok.status_code == 200, ok.text
+    assert mureka.references[0].song_id == "song_1"
+    assert fake.references == []
