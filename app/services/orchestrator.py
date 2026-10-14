@@ -108,10 +108,14 @@ class GenerationOrchestrator:
     ) -> dict[str, Any]:
         job_id = job_id or f"job_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
         selected_provider = provider or self.settings.music_provider
-        effective_duration_minutes = (
-            None if selected_provider == "minimax_music" else duration_minutes
+        # MiniMax and Mureka choose the song length themselves; requested durations are ignored.
+        provider_sets_duration = selected_provider in {"minimax_music", "mureka_music"}
+        effective_duration_minutes = None if provider_sets_duration else duration_minutes
+        effective_count = (
+            count
+            if selected_provider in {"minimax_music", "elevenlabs_music", "mureka_music"}
+            else 1
         )
-        effective_count = count if selected_provider in {"minimax_music", "elevenlabs_music"} else 1
         current_song = None
         latest_result = None
         song_states = [
@@ -197,6 +201,7 @@ class GenerationOrchestrator:
             if duration_seconds is None and selected_provider not in {
                 "minimax_music",
                 "elevenlabs_music",
+                "mureka_music",
             }:
                 duration_seconds = self.settings.default_duration_minutes * 60
             provider_prompt = f"[歌词与创作内容]\n{lyrics}"
@@ -205,9 +210,9 @@ class GenerationOrchestrator:
             duration_diagnostics: dict[str, object] = {
                 "durationSource": (
                     "provider_override"
-                    if selected_provider == "minimax_music" and duration_minutes is not None
+                    if provider_sets_duration and duration_minutes is not None
                     else "provider"
-                    if selected_provider in {"minimax_music", "elevenlabs_music"}
+                    if selected_provider in {"minimax_music", "elevenlabs_music", "mureka_music"}
                     and duration_seconds is None
                     else "user"
                     if duration_minutes is not None
@@ -312,7 +317,7 @@ class GenerationOrchestrator:
                         variation=index,
                         progress=provider_progress,
                         job_id=job_id,
-                        # Only ElevenLabs accepts a reference; callers validate the provider.
+                        # Only ElevenLabs and Mureka accept a reference; callers validate it.
                         **({"reference": reference} if reference is not None else {}),
                     )
                     if task_progress is not None:

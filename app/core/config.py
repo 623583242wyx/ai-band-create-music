@@ -59,9 +59,9 @@ class Settings(BaseSettings):
     llm_disable_thinking: bool = True
 
     music_api_mode: Literal["mock", "real"] = "mock"
-    music_provider: Literal["generic", "suno_api", "elevenlabs_music", "minimax_music"] = (
-        "minimax_music"
-    )
+    music_provider: Literal[
+        "generic", "suno_api", "elevenlabs_music", "minimax_music", "mureka_music"
+    ] = "minimax_music"
     mock_full_song_path: Path = PROJECT_ROOT / "output" / "mock_full.mp3"
     music_api_key: SecretStr | None = None
     music_api_base_url: str = ""
@@ -84,6 +84,13 @@ class Settings(BaseSettings):
     # Audio reference (conditioning_ref) is documented for music_v2 / music_v2_5 only.
     elevenlabs_reference_condition_strength: Literal["low", "medium", "high", "xhigh"] = "medium"
     elevenlabs_reference_max_upload_mb: int = Field(default=30, ge=1, le=200)
+
+    mureka_api_key: SecretStr | None = None
+    mureka_base_url: str = "https://api.mureka.ai"
+    # https://platform.mureka.ai/pricing: mureka-9.5 $0.15/song, mureka-9 / 8 / o2 $0.045/song.
+    mureka_model: str = "mureka-9.5"
+    mureka_timeout_seconds: float = Field(default=900, gt=0)
+    mureka_bypass_global_proxy: bool = True
 
     suno_create_timeout_seconds: float = Field(default=180, gt=0)
     suno_make_instrumental: bool = False
@@ -147,6 +154,7 @@ class Settings(BaseSettings):
         "llm_base_url",
         "elevenlabs_music_base_url",
         "minimax_base_url",
+        "mureka_base_url",
         "music_api_base_url",
     )
     @classmethod

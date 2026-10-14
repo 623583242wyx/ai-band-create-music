@@ -91,9 +91,30 @@ LLM_API_KEY=...
 后端将 LLM 生成的歌词作为 `input`，结构化音乐描述作为 `instructions`，并将返回的
 44.1 kHz WAV 直接保存到 `output`。MiniMax 始终使用自动时长，请求不包含
 `audio_duration`，由模型选择自然完整的时长；即使客户端传入固定时长也会被忽略。
-除 MiniMax 和 ElevenLabs 外，其他 Provider 在未指定时长时使用 `DEFAULT_DURATION_MINUTES`。
+除 MiniMax、ElevenLabs 和 Mureka 外，其他 Provider 在未指定时长时使用 `DEFAULT_DURATION_MINUTES`。
 如果两个服务分别运行在 Docker 容器中，请将 `MINIMAX_BASE_URL` 改为可达的容器服务名
 或宿主机地址。
+
+### Mureka
+
+```env
+MUSIC_API_MODE=real
+MUSIC_PROVIDER=mureka_music
+MUREKA_API_KEY=...
+MUREKA_MODEL=mureka-9.5
+```
+
+后端调用 `POST /v1/song/generate`（`lyrics` 为 LLM 歌词，`prompt` 为结构化风格描述，
+超过 1024 字符时截断；`n=1`，请求两首时独立调用两次），再轮询
+`GET /v1/song/query/{task_id}`，优先下载 `wav_url`，没有时下载 MP3 `url`。
+Mureka 没有时长参数，与 MiniMax 一样忽略固定时长，歌曲最长 5 分 30 秒。
+价格见 <https://platform.mureka.ai/pricing>（`mureka-9.5` 每首 $0.15，`mureka-9` / `mureka-8` /
+`mureka-o2` 每首 $0.045）。
+
+音频参考复用 `POST /api/references` 上传的本地 30 秒 MP3：首次在 Mureka 使用时以
+`purpose=reference` 调用 `POST /v1/files/upload`，返回的文件 id 作为 `reference_id`，
+在进程内缓存（重启后重新上传）。`mureka-o2` 不支持参考。注意：添加参考仍需要先上传到
+ElevenLabs，因为参考列表以 ElevenLabs `song_id` 为 id。
 
 音乐 Prompt 扩写建议使用非推理模型。推理模型可能先输出很长的思考过程，增加
 延迟并触发读取超时。遇到 LLM `ReadTimeout` 时，应先确认 `LLM_MODEL`，再根据
@@ -369,7 +390,7 @@ sudo iptables -D INPUT ! -i br-e71e5f2bd0ad -p tcp --dport 7897 -j DROP
 替换后），各自播放、下载与编辑；多首都有替换后那首时 `mixSong=null`，客户端按每首结果判断。
 202 回显的 `mixConfig` 在读输入的那首上（替换编辑器即原曲），成功后同时写在被覆盖的那首上。
 
-生成音乐。`provider` 可传 `minimax_music` 或 `elevenlabs_music`，不传时使用
+生成音乐。`provider` 可传 `minimax_music`、`elevenlabs_music` 或 `mureka_music`，不传时使用
 `MUSIC_PROVIDER`：
 
 ```bash
@@ -379,7 +400,7 @@ curl -X POST http://127.0.0.1:8010/api/generate \
 ```
 
 `durationSeconds`（10–360）用于 30 秒试听这类精确短时长，传了它就会覆盖
-`durationMinutes`；MiniMax 仍然忽略任何固定时长。可选的 `title`（最长 100 字符）是
+`durationMinutes`；MiniMax 和 Mureka 仍然忽略任何固定时长。可选的 `title`（最长 100 字符）是
 群聊里选定的歌曲名；未传时会在歌词与风格扩写时生成简短歌名。标题随任务持久化，
 并由 `GET /api/jobs` 和任务 SSE 返回，供历史页显示。
 

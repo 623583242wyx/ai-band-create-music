@@ -454,7 +454,7 @@ def build_orchestrator(
     NullCache()
     music_providers = {
         name: create_music_provider(settings, client, direct_client, name)
-        for name in ("minimax_music", "elevenlabs_music")
+        for name in ("minimax_music", "elevenlabs_music", "mureka_music")
     }
     return GenerationOrchestrator(
         settings=settings,
@@ -3061,10 +3061,18 @@ def _generation_parameters(
 def _audio_reference(payload: GenerateRequest, settings: Settings) -> AudioReference | None:
     if payload.referenceId is None:
         return None
-    if (payload.provider or settings.music_provider) != "elevenlabs_music":
-        raise ValueError("音频参考仅支持 ElevenLabs 模型，MiniMax 不支持。")
+    provider = payload.provider or settings.music_provider
+    if provider not in {"elevenlabs_music", "mureka_music"}:
+        raise ValueError("音频参考仅支持 ElevenLabs 和 Mureka 模型，MiniMax 不支持。")
     if settings.music_api_mode != "real":
         raise ValueError("音频参考需要 MUSIC_API_MODE=real。")
+    if provider == "mureka_music":
+        if settings.mureka_model == "mureka-o2":
+            raise ValueError("Mureka mureka-o2 模型不支持音频参考。")
+        if find_reference(settings.output_dir, payload.referenceId) is None:
+            raise ValueError("参考音频不存在或已删除，请重新选择。")
+        # Mureka uploads the local 30 s clip itself; duration and strength are ElevenLabs-only.
+        return AudioReference(payload.referenceId, REFERENCE_MAX_SECONDS * 1000, "")
     if settings.elevenlabs_music_model_id not in ELEVENLABS_REFERENCE_MODELS:
         raise ValueError("音频参考仅支持 ElevenLabs music_v2 / music_v2_5 模型。")
     if settings.elevenlabs_force_instrumental:
