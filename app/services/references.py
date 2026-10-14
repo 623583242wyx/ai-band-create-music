@@ -159,6 +159,43 @@ async def prepare_reference_audio(source: Path, target: Path) -> float:
     return round(min(duration, REFERENCE_MAX_SECONDS), 3)
 
 
+async def loop_reference_audio(source: Path, target: Path) -> None:
+    """Loop a short prepared clip to exactly REFERENCE_MAX_SECONDS.
+
+    Mureka only accepts reference uploads of exactly 30 s, while local references may be 3–30 s.
+    """
+    from app.services.stems import prepare_ffmpeg_environment
+
+    await run_audio_command(
+        [
+            "ffmpeg",
+            "-v",
+            "error",
+            "-nostdin",
+            "-y",
+            "-stream_loop",
+            "-1",
+            "-i",
+            str(source),
+            "-t",
+            str(REFERENCE_MAX_SECONDS),
+            "-ac",
+            "2",
+            "-ar",
+            "44100",
+            "-codec:a",
+            "libmp3lame",
+            "-b:a",
+            "192k",
+            "-f",
+            "mp3",
+            str(target),
+        ],
+        prepare_ffmpeg_environment(),
+        f"无法把参考音频补足到 {REFERENCE_MAX_SECONDS} 秒。",
+    )
+
+
 async def run_audio_command(
     command: list[str], environment: dict[str, str], message: str, *, capture: bool = False
 ) -> str:

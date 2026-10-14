@@ -871,3 +871,33 @@ async def test_mureka_failed_task_reports_reason(tmp_path: Path) -> None:
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(GenerationError, match="content policy"):
             await MurekaMusicProvider(settings, client).generate("rock", None, MINIMAX_USER_PROMPT)
+
+
+async def test_mureka_loops_short_reference_to_30_seconds(tmp_path: Path) -> None:
+    from app.services.references import prepare_reference_audio, reference_audio_name
+
+    settings = make_settings(tmp_path, mureka_api_key="test")
+    source = tmp_path / "short.wav"
+    source.write_bytes(wav_bytes(5))
+    clip = references_dir(settings.output_dir) / reference_audio_name()
+    duration = await prepare_reference_audio(source, clip)
+    save_references(
+        settings.output_dir, [new_reference_entry("ref5", "s.wav", duration, clip.name)]
+    )
+    uploads: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/files/upload":
+            uploads.append(len(request.content))
+            return httpx.Response(200, json={"id": "file-5"})
+        return httpx.Response(200, json={"id": "t", "status": "failed", "failed_reason": "stop"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match="stop"):
+            await MurekaMusicProvider(settings, client).generate(
+                "rock", None, MINIMAX_USER_PROMPT, reference=AudioReference("ref5", 5000, "")
+            )
+
+    # 30 s at 192 kbps is about 720 kB; the original 5 s clip is about 120 kB.
+    assert len(uploads) == 1 and uploads[0] > 600_000
+    assert sorted(path.name for path in clip.parent.iterdir()) == sorted([clip.name, "index.json"])

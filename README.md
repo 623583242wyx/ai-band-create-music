@@ -112,7 +112,8 @@ Mureka 没有时长参数，与 MiniMax 一样忽略固定时长，歌曲最长 
 `mureka-o2` 每首 $0.045）。
 
 音频参考复用 `POST /api/references` 上传的本地 30 秒 MP3：首次在 Mureka 使用时以
-`purpose=reference` 调用 `POST /v1/files/upload`，返回的文件 id 作为 `reference_id`，
+`purpose=reference` 调用 `POST /v1/files/upload`（该接口只接受恰好 30 秒的参考，不足 30 秒的
+本地片段先用 ffmpeg 循环补足到 30 秒再上传），返回的文件 id 作为 `reference_id`，
 在进程内缓存（重启后重新上传）。`mureka-o2` 不支持参考。注意：添加参考仍需要先上传到
 ElevenLabs，因为参考列表以 ElevenLabs `song_id` 为 id。
 

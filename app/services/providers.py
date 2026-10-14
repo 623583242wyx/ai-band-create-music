@@ -22,7 +22,13 @@ from app.services.prompt import (
     _http_failure_message,
     split_generation_prompt,
 )
-from app.services.references import find_reference, references_dir
+from app.services.references import (
+    REFERENCE_MAX_SECONDS,
+    find_reference,
+    loop_reference_audio,
+    reference_audio_name,
+    references_dir,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1099,17 +1105,27 @@ class MurekaMusicProvider:
         audio = entry.get("audio") if entry else None
         if not isinstance(audio, str) or not audio:
             raise GenerationError("参考音频不存在或已删除，请重新选择。")
-        path = references_dir(self._settings.output_dir) / Path(audio).name
+        directory = references_dir(self._settings.output_dir)
+        path = directory / Path(audio).name
         require_readable_file(path, "参考音频文件不可读")
-        with path.open("rb") as handle:
-            # purpose=reference: mp3/m4a, exactly 30 s (longer is trimmed by Mureka).
-            response = await self._client.post(
-                f"{self._settings.mureka_base_url}/v1/files/upload",
-                data={"purpose": "reference"},
-                files={"file": (path.name, handle, "audio/mpeg")},
-                headers=self._headers(),
-                timeout=self._settings.music_api_timeout_seconds,
-            )
+        # purpose=reference accepts mp3/m4a of exactly 30 s; longer is trimmed by Mureka, shorter
+        # local clips (3–30 s) are looped to 30 s in a temporary file first.
+        looped = None
+        if float(entry["durationSeconds"]) < REFERENCE_MAX_SECONDS:
+            looped = directory / f".mureka-{reference_audio_name()}"
+            await loop_reference_audio(path, looped)
+        try:
+            with (looped or path).open("rb") as handle:
+                response = await self._client.post(
+                    f"{self._settings.mureka_base_url}/v1/files/upload",
+                    data={"purpose": "reference"},
+                    files={"file": (path.name, handle, "audio/mpeg")},
+                    headers=self._headers(),
+                    timeout=self._settings.music_api_timeout_seconds,
+                )
+        finally:
+            if looped is not None:
+                looped.unlink(missing_ok=True)
         response.raise_for_status()
         data = response.json()
         file_id = data.get("id") if isinstance(data, dict) else None
