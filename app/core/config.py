@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -32,6 +32,7 @@ class Settings(BaseSettings):
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
+        populate_by_name=True,
     )
 
     host: str = "0.0.0.0"
@@ -83,7 +84,14 @@ class Settings(BaseSettings):
     elevenlabs_bypass_global_proxy: bool = True
     # Audio reference (conditioning_ref) is documented for music_v2 / music_v2_5 only.
     elevenlabs_reference_condition_strength: Literal["low", "medium", "high", "xhigh"] = "medium"
-    elevenlabs_reference_max_upload_mb: int = Field(default=30, ge=1, le=200)
+    audio_reference_max_upload_mb: int = Field(
+        default=30,
+        ge=1,
+        le=200,
+        validation_alias=AliasChoices(
+            "AUDIO_REFERENCE_MAX_UPLOAD_MB", "ELEVENLABS_REFERENCE_MAX_UPLOAD_MB"
+        ),
+    )
 
     mureka_api_key: SecretStr | None = None
     mureka_base_url: str = "https://api.mureka.ai"
@@ -194,8 +202,8 @@ class Settings(BaseSettings):
         return [item.strip() for item in self.cors_origins.split(",") if item.strip()]
 
     @property
-    def elevenlabs_reference_max_upload_bytes(self) -> int:
-        return self.elevenlabs_reference_max_upload_mb * 1024 * 1024
+    def audio_reference_max_upload_bytes(self) -> int:
+        return self.audio_reference_max_upload_mb * 1024 * 1024
 
     @property
     def rvc_max_upload_bytes(self) -> int:

@@ -45,12 +45,22 @@ class FakeElevenLabs:
 
 def reference_app(tmp_path: Path, **updates):
     settings = make_settings(
-        tmp_path, music_api_mode="real", elevenlabs_reference_max_upload_mb=1, **updates
+        tmp_path, music_api_mode="real", audio_reference_max_upload_mb=1, **updates
     )
     orchestrator = make_orchestrator(settings)
     fake = FakeElevenLabs(settings.mock_full_song_path)
     orchestrator.music_providers["elevenlabs_music"] = fake
     return create_app(settings, orchestrator), settings, fake
+
+
+async def test_reference_library_identifies_provider_even_when_empty(tmp_path: Path) -> None:
+    app, _, _ = reference_app(tmp_path)
+    async with client(app) as http:
+        for provider in ("mureka_music", "elevenlabs_music"):
+            response = await http.get("/api/references", params={"provider": provider})
+            assert response.status_code == 200
+            assert response.json().get("provider") == provider
+            assert response.json()["references"] == []
 
 
 async def test_upload_trims_lists_previews_and_deletes(tmp_path: Path) -> None:
@@ -63,17 +73,17 @@ async def test_upload_trims_lists_previews_and_deletes(tmp_path: Path) -> None:
         listed = await http.get("/api/references")
         preview = await http.get(uploaded.json()["audioUrl"].removeprefix("http://testserver"))
         index = await http.get("/output/references/index.json")
-        deleted = await http.delete("/api/references/song_1")
-        deleted_again = await http.delete("/api/references/song_1")
+        deleted = await http.delete(f"/api/references/{uploaded.json()['id']}")
+        deleted_again = await http.delete(f"/api/references/{uploaded.json()['id']}")
         after = await http.get("/api/references")
 
     assert uploaded.status_code == 201, uploaded.text
     body = uploaded.json()
-    assert body["id"] == "song_1"
+    assert len(body["id"]) == 32
     assert body["name"] == "我的 参考.wav"
-    # Trimmed locally to the documented 30 s conditioning limit before the billed upload.
+    # Trimmed locally to the documented 30 s conditioning limit.
     assert 29 <= body["durationSeconds"] <= 30
-    assert fake.uploads[0][0] == "我的 参考.mp3"
+    assert fake.uploads == []
     assert listed.json()["references"] == [body]
     assert listed.json()["maxSeconds"] == 30
     assert preview.status_code == 200 and preview.content[:3] in {b"ID3", b"\xff\xfb", b"\xff\xf3"}
@@ -115,35 +125,38 @@ async def test_upload_rejects_oversized_file(tmp_path: Path, size: int) -> None:
     assert fake.uploads == []
 
 
-async def test_upload_provider_failure_keeps_no_files(tmp_path: Path) -> None:
+async def test_upload_stays_local_when_provider_is_unavailable(tmp_path: Path) -> None:
     app, settings, fake = reference_app(tmp_path)
     fake.upload_error = GenerationError("ElevenLabs 参考音频上传失败：HTTP 422: copyright")
     async with client(app) as http:
         response = await http.post(
             "/api/references", files={"file": ("a.wav", sine_wav(tmp_path / "a.wav", 4))}
         )
-    assert response.status_code == 502
-    assert "copyright" in response.json()["message"]
-    assert not list((settings.output_dir / "references").glob("*.mp3"))
+    assert response.status_code == 201
+    assert fake.uploads == []
+    assert list((settings.output_dir / "references").glob("*.mp3"))
 
 
-async def test_upload_requires_real_mode(tmp_path: Path) -> None:
+async def test_upload_does_not_require_real_mode(tmp_path: Path) -> None:
     settings = make_settings(tmp_path)
     app = create_app(settings, make_orchestrator(settings))
     async with client(app) as http:
-        response = await http.post("/api/references", files={"file": ("a.wav", b"RIFF")})
-    assert response.status_code == 503
+        response = await http.post(
+            "/api/references", files={"file": ("a.wav", sine_wav(tmp_path / "a.wav", 4))}
+        )
+    assert response.status_code == 201
 
 
 async def test_generation_passes_reference_and_validates_it(tmp_path: Path) -> None:
     app, _, fake = reference_app(tmp_path)
     async with client(app) as http:
-        await http.post(
+        uploaded = await http.post(
             "/api/references", files={"file": ("a.wav", sine_wav(tmp_path / "a.wav", 5))}
         )
+        reference_id = uploaded.json()["id"]
         ok = await http.post(
             "/api/generate",
-            json={"prompt": "流行", "provider": "elevenlabs_music", "referenceId": "song_1"},
+            json={"prompt": "流行", "provider": "elevenlabs_music", "referenceId": reference_id},
         )
         missing = await http.post(
             "/api/jobs",
@@ -151,7 +164,7 @@ async def test_generation_passes_reference_and_validates_it(tmp_path: Path) -> N
         )
         minimax = await http.post(
             "/api/jobs",
-            json={"prompt": "流行", "provider": "minimax_music", "referenceId": "song_1"},
+            json={"prompt": "流行", "provider": "minimax_music", "referenceId": reference_id},
         )
         invalid = await http.post(
             "/api/jobs",
@@ -160,7 +173,7 @@ async def test_generation_passes_reference_and_validates_it(tmp_path: Path) -> N
 
     assert ok.status_code == 200, ok.text
     reference = fake.references[0]
-    assert reference.song_id == "song_1"
+    assert reference.song_id == reference_id
     assert 4_900 <= reference.duration_ms <= 5_100
     assert reference.strength == "medium"
     assert missing.status_code == 400 and "不存在" in missing.json()["message"]
@@ -199,13 +212,86 @@ async def test_mureka_generation_receives_local_reference_id(tmp_path: Path) -> 
     mureka = FakeElevenLabs(settings.mock_full_song_path)
     app.state.orchestrator.music_providers["mureka_music"] = mureka
     async with client(app) as http:
-        await http.post(
-            "/api/references", files={"file": ("a.wav", sine_wav(tmp_path / "a.wav", 5))}
+        uploaded = await http.post(
+            "/api/references?provider=mureka_music",
+            files={"file": ("a.wav", sine_wav(tmp_path / "a.wav", 5))},
         )
+        reference_id = uploaded.json()["id"]
         ok = await http.post(
             "/api/generate",
-            json={"prompt": "流行", "provider": "mureka_music", "referenceId": "song_1"},
+            json={"prompt": "流行", "provider": "mureka_music", "referenceId": reference_id},
         )
     assert ok.status_code == 200, ok.text
-    assert mureka.references[0].song_id == "song_1"
+    assert mureka.references[0].song_id == reference_id
     assert fake.references == []
+
+
+async def test_reference_libraries_and_generation_are_isolated_by_provider(tmp_path: Path) -> None:
+    app, settings, _ = reference_app(tmp_path)
+    audio = sine_wav(tmp_path / "a.wav", 5)
+    async with client(app) as http:
+        references = {}
+        for provider in ("mureka_music", "elevenlabs_music"):
+            uploaded = await http.post(
+                f"/api/references?provider={provider}",
+                files={"file": ("a.wav", audio)},
+            )
+            assert uploaded.status_code == 201, uploaded.text
+            references[provider] = uploaded.json()
+            assert uploaded.json()["provider"] == provider
+
+        for provider, reference in references.items():
+            listed = await http.get(f"/api/references?provider={provider}")
+            assert listed.json()["references"] == [reference]
+            other = next(value for key, value in references.items() if key != provider)
+            generation = await http.post(
+                "/api/jobs",
+                json={"prompt": "pop", "provider": provider, "referenceId": other["id"]},
+            )
+            assert generation.status_code == 400
+            assert "不属于当前模型" in generation.json()["message"]
+            deleted = await http.delete(f"/api/references/{other['id']}?provider={provider}")
+            assert deleted.status_code == 404
+
+        for provider, reference in references.items():
+            deleted = await http.delete(f"/api/references/{reference['id']}?provider={provider}")
+            assert deleted.status_code == 204
+
+    assert not list((settings.output_dir / "references").glob("*.mp3"))
+
+
+async def test_unassigned_legacy_reference_is_preserved_but_cannot_cross_providers(
+    tmp_path: Path,
+) -> None:
+    from app.services.references import load_references, new_reference_entry, save_references
+
+    app, settings, _ = reference_app(tmp_path)
+    legacy = new_reference_entry("legacy", "legacy.wav", 5, "legacy.mp3")
+    save_references(settings.output_dir, [legacy])
+    async with client(app) as http:
+        for provider in ("mureka_music", "elevenlabs_music"):
+            listed = await http.get(f"/api/references?provider={provider}")
+            assert listed.json()["references"] == []
+            response = await http.post(
+                "/api/jobs",
+                json={"prompt": "pop", "provider": provider, "referenceId": "legacy"},
+            )
+            assert response.status_code == 400
+            assert "重新上传" in response.json()["message"]
+    assert load_references(settings.output_dir) == [legacy]
+
+
+@pytest.mark.parametrize("provider", ["minimax_music", "invalid", "mureka_music&other=true"])
+async def test_reference_operations_reject_invalid_provider(tmp_path: Path, provider: str) -> None:
+    app, _, _ = reference_app(tmp_path)
+    async with client(app) as http:
+        query = {"provider": provider}
+        assert (await http.get("/api/references", params=query)).status_code == 422
+        assert (
+            await http.post(
+                "/api/references",
+                params=query,
+                files={"file": ("a.mp3", b"fake")},
+            )
+        ).status_code == 422
+        assert (await http.delete("/api/references/ref", params=query)).status_code == 422

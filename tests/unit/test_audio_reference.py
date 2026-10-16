@@ -9,6 +9,12 @@ import pytest
 
 from app.core.errors import GenerationError, ProviderGlobalError
 from app.services.providers import AudioReference, ElevenLabsMusicProvider
+from app.services.references import (
+    clean_reference_name,
+    new_reference_entry,
+    references_dir,
+    save_references,
+)
 from tests.helpers import make_settings
 
 PLAN = {
@@ -18,6 +24,10 @@ PLAN = {
     ]
 }
 REFERENCE = AudioReference("song_abc", 30_000, "high")
+
+
+def test_reference_filename_never_keeps_a_client_path() -> None:
+    assert clean_reference_name(r"..\\..\\evil.mp3") == "evil.mp3"
 
 
 def eleven_settings(tmp_path: Path, **updates: object):
@@ -160,6 +170,35 @@ async def test_upload_reference_returns_song_id(tmp_path: Path) -> None:
     assert b"ID3-clip" in requests[0].content
 
 
+async def test_local_reference_is_uploaded_only_when_generated(tmp_path: Path) -> None:
+    paths: list[str] = []
+    directory = references_dir(tmp_path / "output")
+    directory.mkdir(parents=True)
+    clip = directory / "local.mp3"
+    clip.write_bytes(b"ID3-clip")
+    entry = new_reference_entry("local_ref", "reference.mp3", 30, clip.name)
+    entry["localOnly"] = True
+    save_references(tmp_path / "output", [entry])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/v1/music/upload":
+            return httpx.Response(200, json={"song_id": "remote_ref"})
+        if request.url.path == "/v1/music/plan":
+            return httpx.Response(200, json=PLAN)
+        return httpx.Response(200, content=b"\x00\x00\x01\x00" * 8_000 * 3)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await ElevenLabsMusicProvider(eleven_settings(tmp_path), client).generate(
+            "[Genre: Pop]",
+            None,
+            "[歌词与创作内容]\n第一句",
+            reference=AudioReference("local_ref", 30_000, "high"),
+        )
+
+    assert paths == ["/v1/music/upload", "/v1/music/plan", "/v1/music/stream"]
+
+
 @pytest.mark.parametrize(
     ("response", "error"),
     [
@@ -177,3 +216,32 @@ async def test_upload_reference_failures(tmp_path: Path, response, error) -> Non
             await ElevenLabsMusicProvider(eleven_settings(tmp_path), client).upload_reference(
                 clip, "clip.mp3"
             )
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "is_global"),
+    [
+        (401, "鉴权或权限不足", True),
+        (413, "超过服务限制", False),
+        (422, "格式或时长不被接受", False),
+        (500, "服务暂时不可用", False),
+    ],
+)
+async def test_elevenlabs_reference_upload_reports_specific_error(
+    tmp_path: Path, status: int, message: str, is_global: bool
+) -> None:
+    clip = tmp_path / "clip.mp3"
+    clip.write_bytes(b"ID3-clip")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/music/upload"
+        return httpx.Response(status, json={"detail": "provider detail"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match=message) as caught:
+            await ElevenLabsMusicProvider(eleven_settings(tmp_path), client).upload_reference(
+                clip, "clip.mp3"
+            )
+
+    assert isinstance(caught.value, ProviderGlobalError) is is_global
+    assert "Mureka" not in str(caught.value)

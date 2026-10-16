@@ -1,20 +1,21 @@
-"""ElevenLabs 音频参考：本地预处理与已上传参考的索引。
+"""音频参考的本地预处理与索引。
 
-ElevenLabs 文档（inpainting 指南）规定 conditioning 参考最长 30 秒，上传接口按一次生成计费，
-所以每个文件只上传一次：先在本地裁到 30 秒并转成 MP3，上传后把 song_id 记进索引，
-之后的生成直接复用。ElevenLabs 没有公开删除接口，删除只移除本地记录与试听文件。
+上传阶段只生成本地 MP3 和随机参考 id；实际 provider 上传在生成时按需执行。
 """
 
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import hashlib
 import json
 import logging
 import math
 import os
 import re
 import tempfile
-from contextlib import suppress
+from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,8 +30,7 @@ REFERENCE_INDEX = "index.json"
 # https://elevenlabs.io/docs/eleven-api/guides/how-to/music/inpainting
 # "A conditioning reference can be at most 30 seconds (30,000ms) long."
 REFERENCE_MAX_SECONDS = 30
-# ponytail: ElevenLabs documents no minimum reference length; 3 s mirrors the API's
-# shortest chunk/song length so near-empty clips fail here instead of after a billed upload.
+# Short accepted clips are padded to the provider's required length before remote upload.
 REFERENCE_MIN_SECONDS = 3
 REFERENCE_NAME_MAX_CHARS = 100
 REFERENCE_FFMPEG_TIMEOUT_SECONDS = 120
@@ -46,7 +46,8 @@ def references_dir(output_dir: Path) -> Path:
 
 
 def clean_reference_name(filename: str | None) -> str:
-    name = Path(filename or "").name.strip()
+    # Browsers may send Windows paths; never retain a user-controlled path component.
+    name = Path((filename or "").replace("\\", "/")).name.strip()
     name = re.sub(r"[\x00-\x1f\x7f]", "", name)
     return name[:REFERENCE_NAME_MAX_CHARS] or "参考音频"
 
@@ -86,6 +87,56 @@ def save_references(output_dir: Path, references: list[dict[str, Any]]) -> None:
         Path(name).replace(directory / REFERENCE_INDEX)
     finally:
         Path(name).unlink(missing_ok=True)
+
+
+@asynccontextmanager
+async def reference_lock(output_dir: Path, reference_id: str | None = None):
+    directory = references_dir(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(reference_id.encode()).hexdigest() if reference_id else "index"
+    # Keep the lock inode: unlinking it lets another process lock a different file.
+    with (directory / f".{key}.lock").open("a") as handle:
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                await asyncio.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+async def remote_reference_id(
+    output_dir: Path,
+    reference_id: str,
+    provider: str,
+    scope: str,
+    upload: Callable[[dict[str, Any]], Awaitable[str]],
+) -> str:
+    scope_hash = hashlib.sha256(scope.encode()).hexdigest()
+    async with reference_lock(output_dir, reference_id):
+        entry = find_reference(output_dir, reference_id)
+        if entry is None:
+            raise GenerationError("参考音频不存在或已删除，请重新选择。")
+        if (
+            entry.get("remoteProvider") == provider
+            and entry.get("remoteScope") == scope_hash
+            and isinstance(entry.get("remoteId"), str)
+            and entry["remoteId"]
+        ):
+            return entry["remoteId"]
+        remote_id = await upload(entry)
+        async with reference_lock(output_dir):
+            entries = load_references(output_dir)
+            current = next((item for item in entries if item["id"] == reference_id), None)
+            if current is None:
+                raise GenerationError("参考音频不存在或已删除，请重新选择。")
+            current.update(remoteId=remote_id, remoteProvider=provider, remoteScope=scope_hash)
+            # shortcut: a crash before this write can re-upload; use upstream idempotency if added.
+            save_references(output_dir, entries)
+        return remote_id
 
 
 def new_reference_entry(
@@ -162,7 +213,7 @@ async def prepare_reference_audio(source: Path, target: Path) -> float:
 async def loop_reference_audio(source: Path, target: Path) -> None:
     """Loop a short prepared clip to exactly REFERENCE_MAX_SECONDS.
 
-    Mureka only accepts reference uploads of exactly 30 s, while local references may be 3–30 s.
+    Mureka requires 30 s; padding also keeps short ElevenLabs uploads above its minimum.
     """
     from app.services.stems import prepare_ffmpeg_environment
 

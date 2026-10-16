@@ -849,6 +849,7 @@ async def test_mureka_uploads_reference_once_polls_and_downloads_wav(tmp_path: P
         )
 
     assert reports == [
+        ("preparing_reference", None, None),
         ("waiting_music", None, None),
         ("generating_music", None, None),
         ("generating_music", None, None),
@@ -876,6 +877,38 @@ async def test_mureka_classifies_http_errors(tmp_path: Path, status: int) -> Non
         with pytest.raises(GenerationError) as caught:
             await MurekaMusicProvider(settings, client).generate("rock", None, MINIMAX_USER_PROMPT)
     assert isinstance(caught.value, ProviderGlobalError) == (status in {401, 429})
+
+
+@pytest.mark.parametrize(
+    ("status", "message", "is_global"),
+    [
+        (401, "鉴权或权限不足", True),
+        (413, "超过服务限制", False),
+        (422, "格式或时长不被接受", False),
+        (500, "服务暂时不可用", False),
+    ],
+)
+async def test_mureka_reference_upload_reports_specific_error(
+    tmp_path: Path, status: int, message: str, is_global: bool
+) -> None:
+    settings = make_settings(tmp_path, mureka_api_key="test")
+    directory = references_dir(settings.output_dir)
+    directory.mkdir(parents=True)
+    (directory / "clip.mp3").write_bytes(b"mp3")
+    save_references(settings.output_dir, [new_reference_entry("ref", "a.mp3", 30, "clip.mp3")])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/files/upload"
+        return httpx.Response(status, json={"error": {"message": "provider detail"}})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match=message) as caught:
+            await MurekaMusicProvider(settings, client).generate(
+                "rock", None, MINIMAX_USER_PROMPT, reference=AudioReference("ref", 30_000, "")
+            )
+
+    assert isinstance(caught.value, ProviderGlobalError) is is_global
+    assert "ElevenLabs" not in str(caught.value)
 
 
 async def test_mureka_failed_task_reports_reason(tmp_path: Path) -> None:
@@ -915,4 +948,6 @@ async def test_mureka_loops_short_reference_to_30_seconds(tmp_path: Path) -> Non
 
     # 30 s at 192 kbps is about 720 kB; the original 5 s clip is about 120 kB.
     assert len(uploads) == 1 and uploads[0] > 600_000
-    assert sorted(path.name for path in clip.parent.iterdir()) == sorted([clip.name, "index.json"])
+    assert sorted(path.name for path in clip.parent.iterdir() if path.suffix != ".lock") == sorted(
+        [clip.name, "index.json"]
+    )

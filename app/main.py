@@ -87,6 +87,7 @@ from app.services.references import (
     new_reference_entry,
     prepare_reference_audio,
     reference_audio_name,
+    reference_lock,
     references_dir,
     save_references,
 )
@@ -564,14 +565,13 @@ def create_app(
         default_limit=application_settings.request_max_bytes,
         # Multipart framing adds a little on top of the audio file itself.
         path_limits={
-            "/api/references": application_settings.elevenlabs_reference_max_upload_bytes
+            "/api/references": application_settings.audio_reference_max_upload_bytes
             + 1024 * 1024,
             "/api/jobs/*/recordings": (application_settings.recording_max_upload_mb + 1)
             * 1024
             * 1024,
         },
     )
-    application.state.reference_lock = asyncio.Lock()
 
     @application.get("/api/health")
     async def health(request: Request) -> dict[str, object]:
@@ -603,7 +603,7 @@ def create_app(
                     in ELEVENLABS_REFERENCE_MODELS
                     and not application_settings.elevenlabs_force_instrumental,
                     "maxSeconds": REFERENCE_MAX_SECONDS,
-                    "maxUploadMb": application_settings.elevenlabs_reference_max_upload_mb,
+                    "maxUploadMb": application_settings.audio_reference_max_upload_mb,
                     "conditionStrength": (
                         application_settings.elevenlabs_reference_condition_strength
                     ),
@@ -897,6 +897,7 @@ def create_app(
         audio = entry.get("audio")
         return {
             "id": entry["id"],
+            "provider": entry.get("provider"),
             "name": entry.get("name") or "参考音频",
             "durationSeconds": entry["durationSeconds"],
             "createdAt": entry.get("createdAt"),
@@ -908,14 +909,19 @@ def create_app(
         }
 
     @application.get("/api/references")
-    async def list_audio_references(request: Request):
+    async def list_audio_references(
+        request: Request,
+        provider: Literal["elevenlabs_music", "mureka_music"] = "elevenlabs_music",
+    ):
         return {
+            "provider": provider,
             "references": [
                 _reference_response(entry, request)
                 for entry in load_references(application_settings.output_dir)
+                if entry.get("provider") == provider
             ],
             "maxSeconds": REFERENCE_MAX_SECONDS,
-            "maxUploadMb": application_settings.elevenlabs_reference_max_upload_mb,
+            "maxUploadMb": application_settings.audio_reference_max_upload_mb,
         }
 
     @application.post(
@@ -924,25 +930,21 @@ def create_app(
         responses={
             400: {"model": ErrorResponse},
             413: {"model": ErrorResponse},
-            502: {"model": ErrorResponse},
-            503: {"model": ErrorResponse},
+            500: {"model": ErrorResponse},
         },
     )
-    async def upload_audio_reference(request: Request, file: Annotated[UploadFile, File()]):
+    async def upload_audio_reference(
+        request: Request,
+        file: Annotated[UploadFile, File()],
+        provider: Literal["elevenlabs_music", "mureka_music"] = "elevenlabs_music",
+    ):
         def error(code: int, message: str) -> JSONResponse:
             return JSONResponse(status_code=code, content={"success": False, "message": message})
 
-        provider = _orchestrator(request).music_providers.get("elevenlabs_music")
-        if application_settings.music_api_mode != "real" or not hasattr(
-            provider, "upload_reference"
-        ):
-            return error(503, "音频参考需要 MUSIC_API_MODE=real 并配置 ElevenLabs。")
-        if application_settings.elevenlabs_music_model_id not in ELEVENLABS_REFERENCE_MODELS:
-            return error(400, "音频参考仅支持 ElevenLabs music_v2 / music_v2_5 模型。")
         name = clean_reference_name(file.filename)
         directory = references_dir(application_settings.output_dir)
         directory.mkdir(parents=True, exist_ok=True)
-        limit = application_settings.elevenlabs_reference_max_upload_bytes
+        limit = application_settings.audio_reference_max_upload_bytes
         descriptor, raw_name = tempfile.mkstemp(dir=directory, prefix=".upload.")
         raw_path = Path(raw_name)
         prepared = directory / reference_audio_name()
@@ -956,7 +958,7 @@ def create_app(
                         return error(
                             413,
                             "参考音频不能超过 "
-                            f"{application_settings.elevenlabs_reference_max_upload_mb} MB。",
+                            f"{application_settings.audio_reference_max_upload_mb} MB。",
                         )
                     raw.write(chunk)
             if written == 0:
@@ -968,26 +970,35 @@ def create_app(
             except GenerationError as exc:
                 logger.error("audio reference preprocessing unavailable: %s", exc)
                 return error(500, str(exc))
-            try:
-                song_id = await provider.upload_reference(
-                    prepared, f"{Path(name).stem or 'reference'}.mp3"
-                )
-            except GenerationError as exc:
-                logger.warning("audio reference upload failed: %s", exc)
-                return error(502, str(exc))
-            entry = new_reference_entry(song_id, name, duration, prepared.name)
-            async with request.app.state.reference_lock:
+            # The random local name, rather than the client filename, is the reference id.
+            entry = new_reference_entry(prepared.stem, name, duration, prepared.name)
+            entry["provider"] = provider
+            entry["localOnly"] = True
+            entry["sha256"] = hashlib.sha256(prepared.read_bytes()).hexdigest()
+            async with reference_lock(application_settings.output_dir):
                 existing = load_references(application_settings.output_dir)
+                duplicate = None
                 for old in existing:
-                    if old["id"] == song_id and old.get("audio") != prepared.name:
-                        (directory / Path(str(old.get("audio") or "")).name).unlink(missing_ok=True)
-                save_references(
-                    application_settings.output_dir,
-                    [entry, *(old for old in existing if old["id"] != song_id)],
-                )
-            registered = True
+                    if old.get("provider") != provider:
+                        continue
+                    audio = directory / Path(str(old.get("audio") or "")).name
+                    if not audio.is_file():
+                        continue
+                    digest = old.get("sha256") or hashlib.sha256(audio.read_bytes()).hexdigest()
+                    if digest == entry["sha256"]:
+                        duplicate = old
+                        break
+                if duplicate is not None:
+                    entry = duplicate
+                    if "sha256" not in entry:
+                        entry["sha256"] = digest
+                        save_references(application_settings.output_dir, existing)
+                else:
+                    save_references(application_settings.output_dir, [entry, *existing])
+                    registered = True
             return JSONResponse(
-                status_code=status.HTTP_201_CREATED, content=_reference_response(entry, request)
+                status_code=status.HTTP_201_CREATED if registered else status.HTTP_200_OK,
+                content=_reference_response(entry, request),
             )
         finally:
             await file.close()
@@ -1000,10 +1011,21 @@ def create_app(
         status_code=status.HTTP_204_NO_CONTENT,
         responses={404: {"model": ErrorResponse}},
     )
-    async def delete_audio_reference(reference_id: str, request: Request):
-        async with request.app.state.reference_lock:
+    async def delete_audio_reference(
+        reference_id: str,
+        request: Request,
+        provider: Literal["elevenlabs_music", "mureka_music"] = "elevenlabs_music",
+    ):
+        async with reference_lock(application_settings.output_dir):
             existing = load_references(application_settings.output_dir)
-            entry = next((item for item in existing if item["id"] == reference_id), None)
+            entry = next(
+                (
+                    item
+                    for item in existing
+                    if item["id"] == reference_id and item.get("provider") == provider
+                ),
+                None,
+            )
             if entry is None:
                 return JSONResponse(
                     status_code=status.HTTP_404_NOT_FOUND,
@@ -1016,7 +1038,6 @@ def create_app(
         audio = Path(str(entry.get("audio") or "")).name
         if audio:
             (references_dir(application_settings.output_dir) / audio).unlink(missing_ok=True)
-        # ElevenLabs has no documented delete endpoint for uploaded songs; only local state goes.
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @application.get("/api/jobs")
@@ -3066,20 +3087,20 @@ def _audio_reference(payload: GenerateRequest, settings: Settings) -> AudioRefer
         raise ValueError("音频参考仅支持 ElevenLabs 和 Mureka 模型，MiniMax 不支持。")
     if settings.music_api_mode != "real":
         raise ValueError("音频参考需要 MUSIC_API_MODE=real。")
+    entry = find_reference(settings.output_dir, payload.referenceId)
+    if entry is None:
+        raise ValueError("参考音频不存在或已删除，请重新选择。")
+    if entry.get("provider") != provider:
+        raise ValueError("参考音频不属于当前模型，请为当前模型重新上传。")
     if provider == "mureka_music":
         if settings.mureka_model == "mureka-o2":
             raise ValueError("Mureka mureka-o2 模型不支持音频参考。")
-        if find_reference(settings.output_dir, payload.referenceId) is None:
-            raise ValueError("参考音频不存在或已删除，请重新选择。")
         # Mureka uploads the local 30 s clip itself; duration and strength are ElevenLabs-only.
         return AudioReference(payload.referenceId, REFERENCE_MAX_SECONDS * 1000, "")
     if settings.elevenlabs_music_model_id not in ELEVENLABS_REFERENCE_MODELS:
         raise ValueError("音频参考仅支持 ElevenLabs music_v2 / music_v2_5 模型。")
     if settings.elevenlabs_force_instrumental:
         raise ValueError("音频参考不能与 ELEVENLABS_FORCE_INSTRUMENTAL=true 同时使用。")
-    entry = find_reference(settings.output_dir, payload.referenceId)
-    if entry is None:
-        raise ValueError("参考音频不存在或已删除，请重新选择。")
     duration_ms = int(min(float(entry["durationSeconds"]), REFERENCE_MAX_SECONDS) * 1000)
     return AudioReference(
         entry["id"], duration_ms, settings.elevenlabs_reference_condition_strength

@@ -17,6 +17,11 @@ AI 音乐生成与 RVC 人声替换的纯 FastAPI 后端。项目使用 `uv` 固
 
 ## 安装
 
+开发、运行和测试均以 Linux 为支持平台（`uv` 已限定 `sys_platform == 'linux'`）。
+Windows 请在 WSL2 的 Linux 环境或 Linux 容器中执行以下命令和 `uv run pytest`；
+不支持在原生 Windows Python 中直接安装或收集测试。参考音频的跨进程去重依赖 POSIX
+`fcntl` 文件锁，不提供仅进程内锁的降级，以保持并发上传的去重保证。
+
 项目固定使用 Python 3.10：
 
 ```bash
@@ -56,24 +61,32 @@ ElevenLabs 直接接收完整的结构化歌词和扩充风格标签，由模型
 `ELEVENLABS_FORCE_INSTRUMENTAL=true` 时会自动关闭 ElevenLabs 中文人声要求，避免与纯音乐
 模式冲突。
 
-### ElevenLabs 音频参考
+### 音频参考
 
 `POST /api/references`（multipart 字段 `file`）上传一段参考音频，用来引导新歌的整体音色、
-制作风格、配器、速度与情绪（不会复制或混音原曲）。仅支持 `music_v2` / `music_v2_5`，
-且不能与 `ELEVENLABS_FORCE_INSTRUMENTAL=true` 同时使用；MiniMax 不支持。
+制作风格、配器、速度与情绪（不会复制或混音原曲）。参考音频可用于 ElevenLabs `music_v2` /
+`music_v2_5` 或 Mureka（`mureka-o2` 不支持）；MiniMax 不支持。ElevenLabs 参考不能与
+`ELEVENLABS_FORCE_INSTRUMENTAL=true` 同时使用。
 
-- 后端先用 ffmpeg 截取前 30 秒（ElevenLabs 文档规定 conditioning 参考最长 30,000 ms）并转成
-  MP3，再调用 `POST /v1/music/upload`。**上传按一次歌曲生成计费**，被检测为版权内容时仍收一半
-  费用，所以每个文件只上传一次，`song_id` 记录在 `output/references/index.json`，之后直接复用。
-- `GET /api/references` 列出已上传参考（含 `output/references/*.mp3` 试听地址），
-  `DELETE /api/references/<id>` 只删除本地记录与试听文件（ElevenLabs 没有公开的删除接口）。
-- 生成请求（`/api/generate`、`/api/jobs`）带 `referenceId` 时，后端先调用免费的
-  `POST /v1/music/plan` 把同一份 Prompt 转成 composition plan，再在第一个 chunk 上加
-  `conditioning_ref`（参考的 0–N 毫秒）与 `condition_strength`
-  （`ELEVENLABS_REFERENCE_CONDITION_STRENGTH`，默认 `medium`；实测 `high` 会过于贴近参考），然后以 `composition_plan`
-  调用 stream 接口。此时不发送 `prompt` / `music_length_ms` / `force_instrumental`
-  （接口规定它们不能与 composition plan 同时使用），目标时长交给 plan 接口。
-- 单文件上限 `ELEVENLABS_REFERENCE_MAX_UPLOAD_MB`（默认 30 MB），参考至少 3 秒。
+- 上传阶段只在本地完成：后端将文件转为最长 30 秒的 MP3，生成随机本地参考 id 并保存至
+  `output/references/`；**不会调用 ElevenLabs 或 Mureka 接口**。
+- `GET /api/references` 列出本地参考（含 `output/references/*.mp3` 试听地址）；
+  `DELETE /api/references/<id>` 仅删除本地记录与试听文件。
+- 生成请求（`/api/generate`、`/api/jobs`）带 `referenceId` 时，才按当前 provider 上传本地文件：
+  ElevenLabs 先调用 `POST /v1/music/upload`，再调用免费的 `POST /v1/music/plan`，在首个
+  chunk 加入 `conditioning_ref` 和 `condition_strength`
+  （`ELEVENLABS_REFERENCE_CONDITION_STRENGTH`，默认 `medium`），最后以 `composition_plan`
+  调用 stream 接口；Mureka 使用 `POST /v1/files/upload` 的 `purpose=reference`，短于 30 秒时会先在本地循环补足。
+  provider 返回的远端 id 持久化到本地索引，重启后继续复用；文件锁保证共享同一输出目录的
+  进程不会并发重复上传。同一服务商下相同内容的本地参考也会复用，Mureka 和 ElevenLabs 仍相互隔离。
+  ElevenLabs 不足 10 秒的参考会先循环补至 30 秒；本地仍接受至少 3 秒的音频。
+  生成时会先报告参考音频准备阶段，首次上传仍可能按服务商规则计费。
+  缓存与服务商地址、API 凭据绑定，变更后会重新上传；凭据只保存不可逆摘要，不写入索引原文。
+  若进程在远端已受理、但本地索引尚未写回时崩溃，仍可能再次上传；目前上游未使用幂等键。
+- 单文件上限 `AUDIO_REFERENCE_MAX_UPLOAD_MB`（默认 30 MB），参考至少 3 秒。
+  部署时还需对齐网关/反向代理的请求体限制，并为 multipart 边界和字段开销预留余量；
+  例如后端为 30 MB 时，nginx 可设置 `client_max_body_size 32m;`，其它代理层也需同步检查。
+  若小于后端上限的文件仍返回 413，应检查网关限制，不能只调整应用配置。
 
 自部署 MiniMax Music 3 使用兼容的 `/v1/audio/jobs` 接口：
 
@@ -111,11 +124,7 @@ Mureka 没有时长参数，与 MiniMax 一样忽略固定时长，歌曲最长 
 价格见 <https://platform.mureka.ai/pricing>（`mureka-9.5` 每首 $0.15，`mureka-9` / `mureka-8` /
 `mureka-o2` 每首 $0.045）。
 
-音频参考复用 `POST /api/references` 上传的本地 30 秒 MP3：首次在 Mureka 使用时以
-`purpose=reference` 调用 `POST /v1/files/upload`（该接口只接受恰好 30 秒的参考，不足 30 秒的
-本地片段先用 ffmpeg 循环补足到 30 秒再上传），返回的文件 id 作为 `reference_id`，
-在进程内缓存（重启后重新上传）。`mureka-o2` 不支持参考。注意：添加参考仍需要先上传到
-ElevenLabs，因为参考列表以 ElevenLabs `song_id` 为 id。
+音频参考流程见上文“音频参考”；Mureka 的远端 `reference_id` 在首次生成时创建并仅在进程内缓存。
 
 音乐 Prompt 扩写建议使用非推理模型。推理模型可能先输出很长的思考过程，增加
 延迟并触发读取超时。遇到 LLM `ReadTimeout` 时，应先确认 `LLM_MODEL`，再根据
