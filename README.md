@@ -17,6 +17,11 @@ AI 音乐生成与 RVC 人声替换的纯 FastAPI 后端。项目使用 `uv` 固
 
 ## 安装
 
+开发、运行和测试均以 Linux 为支持平台（`uv` 已限定 `sys_platform == 'linux'`）。
+Windows 请在 WSL2 的 Linux 环境或 Linux 容器中执行以下命令和 `uv run pytest`；
+不支持在原生 Windows Python 中直接安装或收集测试。参考音频的跨进程去重依赖 POSIX
+`fcntl` 文件锁，不提供仅进程内锁的降级，以保持并发上传的去重保证。
+
 项目固定使用 Python 3.10：
 
 ```bash
@@ -79,6 +84,9 @@ ElevenLabs 直接接收完整的结构化歌词和扩充风格标签，由模型
   缓存与服务商地址、API 凭据绑定，变更后会重新上传；凭据只保存不可逆摘要，不写入索引原文。
   若进程在远端已受理、但本地索引尚未写回时崩溃，仍可能再次上传；目前上游未使用幂等键。
 - 单文件上限 `AUDIO_REFERENCE_MAX_UPLOAD_MB`（默认 30 MB），参考至少 3 秒。
+  部署时还需对齐网关/反向代理的请求体限制，并为 multipart 边界和字段开销预留余量；
+  例如后端为 30 MB 时，nginx 可设置 `client_max_body_size 32m;`，其它代理层也需同步检查。
+  若小于后端上限的文件仍返回 413，应检查网关限制，不能只调整应用配置。
 
 自部署 MiniMax Music 3 使用兼容的 `/v1/audio/jobs` 接口：
 
