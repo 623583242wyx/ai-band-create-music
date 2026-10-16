@@ -1,8 +1,6 @@
-"""ElevenLabs 音频参考：本地预处理与已上传参考的索引。
+"""音频参考的本地预处理与索引。
 
-ElevenLabs 文档（inpainting 指南）规定 conditioning 参考最长 30 秒，上传接口按一次生成计费，
-所以每个文件只上传一次：先在本地裁到 30 秒并转成 MP3，上传后把 song_id 记进索引，
-之后的生成直接复用。ElevenLabs 没有公开删除接口，删除只移除本地记录与试听文件。
+上传阶段只生成本地 MP3 和随机参考 id；实际 provider 上传在生成时按需执行。
 """
 
 from __future__ import annotations
@@ -46,7 +44,8 @@ def references_dir(output_dir: Path) -> Path:
 
 
 def clean_reference_name(filename: str | None) -> str:
-    name = Path(filename or "").name.strip()
+    # Browsers may send Windows paths; never retain a user-controlled path component.
+    name = Path((filename or "").replace("\\", "/")).name.strip()
     name = re.sub(r"[\x00-\x1f\x7f]", "", name)
     return name[:REFERENCE_NAME_MAX_CHARS] or "参考音频"
 

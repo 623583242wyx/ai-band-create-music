@@ -59,6 +59,38 @@ MUREKA_PROMPT_MAX_CHARS = 1024
 LYRIC_BREAK_PATTERN = re.compile(r"(?<=[，。！？；、,.!?;:：])")
 
 
+def _reference_upload_http_error(
+    provider: str, credential: str, error: httpx.HTTPStatusError
+) -> GenerationError:
+    status = error.response.status_code
+    detail = _http_failure_message(error)
+    if status in {401, 403}:
+        return ProviderGlobalError(
+            f"{provider} 参考音频上传失败：鉴权或权限不足（{detail}），请检查 {credential}。"
+        )
+    if status == 402:
+        return ProviderGlobalError(
+            f"{provider} 参考音频上传失败：账户额度或套餐不可用（{detail}）。"
+        )
+    if status == 429:
+        return ProviderGlobalError(
+            f"{provider} 参考音频上传失败：请求过于频繁（{detail}），请稍后重试。"
+        )
+    if status == 413:
+        return GenerationError(
+            f"{provider} 参考音频上传失败：处理后的文件超过服务限制（{detail}）。"
+        )
+    if status in {415, 422}:
+        return GenerationError(
+            f"{provider} 参考音频上传失败：文件格式或时长不被接受（{detail}）。"
+        )
+    if status >= 500:
+        return GenerationError(
+            f"{provider} 参考音频上传失败：服务暂时不可用（{detail}），请稍后重试。"
+        )
+    return GenerationError(f"{provider} 参考音频上传失败：{detail}")
+
+
 class ProviderProgressCallback(Protocol):
     async def __call__(
         self,
@@ -105,7 +137,7 @@ def _audio_target(
 
 @dataclass(frozen=True, slots=True)
 class AudioReference:
-    """An uploaded ElevenLabs song used as conditioning_ref for the first plan chunk."""
+    """A locally stored audio reference supplied to a music provider."""
 
     song_id: str
     duration_ms: int
@@ -369,6 +401,7 @@ class ElevenLabsMusicProvider:
     def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
         self._settings = settings
         self._client = client
+        self._reference_songs: dict[str, str] = {}
 
     def _api_key(self) -> str:
         secret = self._settings.elevenlabs_api_key or self._settings.music_api_key
@@ -391,23 +424,43 @@ class ElevenLabsMusicProvider:
                     timeout=self._settings.music_api_timeout_seconds,
                 )
             response.raise_for_status()
-            data = response.json()
         except httpx.HTTPStatusError as exc:
-            error_type = (
-                ProviderGlobalError
-                if exc.response.status_code in GLOBAL_PROVIDER_HTTP_STATUSES
-                else GenerationError
-            )
-            raise error_type(
-                self._failure_message(exc).replace("音乐生成失败", "参考音频上传失败")
+            raise _reference_upload_http_error("ElevenLabs", "ELEVENLABS_API_KEY", exc) from exc
+        except httpx.TimeoutException as exc:
+            raise GenerationError("ElevenLabs 参考音频上传失败：请求超时，请稍后重试。") from exc
+        except httpx.ConnectError as exc:
+            raise GenerationError(
+                "ElevenLabs 参考音频上传失败：无法连接 ElevenLabs 服务。"
             ) from exc
-        except (httpx.HTTPError, ValueError) as exc:
+        except httpx.HTTPError as exc:
             raise GenerationError(
                 f"ElevenLabs 参考音频上传失败：{_http_failure_message(exc)}"
+            ) from exc
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise GenerationError(
+                "ElevenLabs 参考音频上传失败：服务返回的响应不是有效 JSON。"
             ) from exc
         song_id = data.get("song_id") if isinstance(data, dict) else None
         if not isinstance(song_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", song_id):
             raise GenerationError("ElevenLabs 参考音频上传失败：接口未返回有效的 song_id。")
+        return song_id
+
+    async def _reference_song_id(self, reference_id: str) -> str:
+        if cached := self._reference_songs.get(reference_id):
+            return cached
+        entry = find_reference(self._settings.output_dir, reference_id)
+        # References created before local-only uploads already contain ElevenLabs song ids.
+        if not entry or not entry.get("localOnly"):
+            return reference_id
+        audio = entry.get("audio")
+        if not isinstance(audio, str) or not audio:
+            raise GenerationError("参考音频不存在或已删除，请重新选择。")
+        path = references_dir(self._settings.output_dir) / Path(audio).name
+        require_readable_file(path, "参考音频文件不可读")
+        song_id = await self.upload_reference(path, path.name)
+        self._reference_songs[reference_id] = song_id
         return song_id
 
     async def _reference_plan(
@@ -541,6 +594,11 @@ class ElevenLabsMusicProvider:
 
             expected_seconds: float | None = duration_seconds
             if reference is not None:
+                reference = AudioReference(
+                    await self._reference_song_id(reference.song_id),
+                    reference.duration_ms,
+                    reference.strength,
+                )
                 plan, expected_seconds = await self._reference_plan(
                     prompt, duration_seconds, reference, job_id, variation
                 )
@@ -1113,21 +1171,40 @@ class MurekaMusicProvider:
         looped = None
         if float(entry["durationSeconds"]) < REFERENCE_MAX_SECONDS:
             looped = directory / f".mureka-{reference_audio_name()}"
-            await loop_reference_audio(path, looped)
+            try:
+                await loop_reference_audio(path, looped)
+            except ValueError as exc:
+                raise GenerationError(f"Mureka 参考音频处理失败：{exc}") from exc
         try:
-            with (looped or path).open("rb") as handle:
-                response = await self._client.post(
-                    f"{self._settings.mureka_base_url}/v1/files/upload",
-                    data={"purpose": "reference"},
-                    files={"file": (path.name, handle, "audio/mpeg")},
-                    headers=self._headers(),
-                    timeout=self._settings.music_api_timeout_seconds,
-                )
+            try:
+                with (looped or path).open("rb") as handle:
+                    response = await self._client.post(
+                        f"{self._settings.mureka_base_url}/v1/files/upload",
+                        data={"purpose": "reference"},
+                        files={"file": (path.name, handle, "audio/mpeg")},
+                        headers=self._headers(),
+                        timeout=self._settings.music_api_timeout_seconds,
+                    )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                raise _reference_upload_http_error("Mureka", "MUREKA_API_KEY", exc) from exc
+            except httpx.TimeoutException as exc:
+                raise GenerationError("Mureka 参考音频上传失败：请求超时，请稍后重试。") from exc
+            except httpx.ConnectError as exc:
+                raise GenerationError("Mureka 参考音频上传失败：无法连接 Mureka 服务。") from exc
+            except httpx.HTTPError as exc:
+                raise GenerationError(
+                    f"Mureka 参考音频上传失败：{_http_failure_message(exc)}"
+                ) from exc
+            try:
+                data = response.json()
+            except ValueError as exc:
+                raise GenerationError(
+                    "Mureka 参考音频上传失败：服务返回的响应不是有效 JSON。"
+                ) from exc
         finally:
             if looped is not None:
                 looped.unlink(missing_ok=True)
-        response.raise_for_status()
-        data = response.json()
         file_id = data.get("id") if isinstance(data, dict) else None
         if not isinstance(file_id, str) or not file_id:
             raise GenerationError("Mureka 参考音频上传失败：接口未返回文件 id。")

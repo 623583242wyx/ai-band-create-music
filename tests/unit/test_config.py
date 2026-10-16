@@ -41,6 +41,18 @@ def test_elevenlabs_non_pcm_output_is_rejected_at_config_load(tmp_path: Path) ->
         make_settings(tmp_path, elevenlabs_music_output_format="mp3_44100_128")
 
 
+def test_reference_upload_limit_defaults_to_30_mb_and_is_configurable(tmp_path: Path) -> None:
+    assert make_settings(tmp_path).audio_reference_max_upload_mb == 30
+    configured = make_settings(tmp_path, audio_reference_max_upload_mb=31)
+    assert configured.audio_reference_max_upload_mb == 31
+
+
+def test_reference_upload_limit_uses_global_environment_variable(monkeypatch) -> None:
+    monkeypatch.setenv("ELEVENLABS_REFERENCE_MAX_UPLOAD_MB", "29")
+    monkeypatch.setenv("AUDIO_REFERENCE_MAX_UPLOAD_MB", "31")
+    assert Settings(_env_file=None).audio_reference_max_upload_mb == 31
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
