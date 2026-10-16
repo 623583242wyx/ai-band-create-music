@@ -849,6 +849,7 @@ async def test_mureka_uploads_reference_once_polls_and_downloads_wav(tmp_path: P
         )
 
     assert reports == [
+        ("preparing_reference", None, None),
         ("waiting_music", None, None),
         ("generating_music", None, None),
         ("generating_music", None, None),
@@ -947,4 +948,6 @@ async def test_mureka_loops_short_reference_to_30_seconds(tmp_path: Path) -> Non
 
     # 30 s at 192 kbps is about 720 kB; the original 5 s clip is about 120 kB.
     assert len(uploads) == 1 and uploads[0] > 600_000
-    assert sorted(path.name for path in clip.parent.iterdir()) == sorted([clip.name, "index.json"])
+    assert sorted(path.name for path in clip.parent.iterdir() if path.suffix != ".lock") == sorted(
+        [clip.name, "index.json"]
+    )

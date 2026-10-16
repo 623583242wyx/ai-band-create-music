@@ -28,6 +28,7 @@ from app.services.references import (
     loop_reference_audio,
     reference_audio_name,
     references_dir,
+    remote_reference_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -401,7 +402,6 @@ class ElevenLabsMusicProvider:
     def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
         self._settings = settings
         self._client = client
-        self._reference_songs: dict[str, str] = {}
 
     def _api_key(self) -> str:
         secret = self._settings.elevenlabs_api_key or self._settings.music_api_key
@@ -448,20 +448,35 @@ class ElevenLabsMusicProvider:
         return song_id
 
     async def _reference_song_id(self, reference_id: str) -> str:
-        if cached := self._reference_songs.get(reference_id):
-            return cached
         entry = find_reference(self._settings.output_dir, reference_id)
         # References created before local-only uploads already contain ElevenLabs song ids.
         if not entry or not entry.get("localOnly"):
             return reference_id
+        return await remote_reference_id(
+            self._settings.output_dir,
+            reference_id,
+            "elevenlabs_music",
+            f"{self._settings.elevenlabs_music_base_url}:{self._api_key()}",
+            self._upload_local_reference,
+        )
+
+    async def _upload_local_reference(self, entry: dict[str, Any]) -> str:
         audio = entry.get("audio")
         if not isinstance(audio, str) or not audio:
             raise GenerationError("参考音频不存在或已删除，请重新选择。")
         path = references_dir(self._settings.output_dir) / Path(audio).name
         require_readable_file(path, "参考音频文件不可读")
-        song_id = await self.upload_reference(path, path.name)
-        self._reference_songs[reference_id] = song_id
-        return song_id
+        looped = None
+        try:
+            if float(entry["durationSeconds"]) < 10:
+                looped = path.parent / f".elevenlabs-{reference_audio_name()}"
+                await loop_reference_audio(path, looped)
+            return await self.upload_reference(looped or path, path.name)
+        except ValueError as exc:
+            raise GenerationError(f"ElevenLabs 参考音频处理失败：{exc}") from exc
+        finally:
+            if looped is not None:
+                looped.unlink(missing_ok=True)
 
     async def _reference_plan(
         self,
@@ -594,6 +609,7 @@ class ElevenLabsMusicProvider:
 
             expected_seconds: float | None = duration_seconds
             if reference is not None:
+                await self._report_progress(progress, "preparing_reference")
                 reference = AudioReference(
                     await self._reference_song_id(reference.song_id),
                     reference.duration_ms,
@@ -1146,9 +1162,6 @@ class MurekaMusicProvider:
     def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
         self._settings = settings
         self._client = client
-        # ponytail: in-memory cache of local reference id → Mureka file id; lost on restart,
-        # then the 30 s clip is simply uploaded again. Persist in the index if uploads get billed.
-        self._reference_files: dict[str, str] = {}
 
     def _headers(self) -> dict[str, str]:
         secret = self._settings.mureka_api_key
@@ -1157,10 +1170,16 @@ class MurekaMusicProvider:
         return {"Authorization": f"Bearer {secret.get_secret_value()}"}
 
     async def _reference_file_id(self, reference_id: str) -> str:
-        if cached := self._reference_files.get(reference_id):
-            return cached
-        entry = find_reference(self._settings.output_dir, reference_id)
-        audio = entry.get("audio") if entry else None
+        return await remote_reference_id(
+            self._settings.output_dir,
+            reference_id,
+            "mureka_music",
+            f"{self._settings.mureka_base_url}:{self._headers()['Authorization']}",
+            self._upload_local_reference,
+        )
+
+    async def _upload_local_reference(self, entry: dict[str, Any]) -> str:
+        audio = entry.get("audio")
         if not isinstance(audio, str) or not audio:
             raise GenerationError("参考音频不存在或已删除，请重新选择。")
         directory = references_dir(self._settings.output_dir)
@@ -1169,13 +1188,13 @@ class MurekaMusicProvider:
         # purpose=reference accepts mp3/m4a of exactly 30 s; longer is trimmed by Mureka, shorter
         # local clips (3–30 s) are looped to 30 s in a temporary file first.
         looped = None
-        if float(entry["durationSeconds"]) < REFERENCE_MAX_SECONDS:
-            looped = directory / f".mureka-{reference_audio_name()}"
-            try:
-                await loop_reference_audio(path, looped)
-            except ValueError as exc:
-                raise GenerationError(f"Mureka 参考音频处理失败：{exc}") from exc
         try:
+            if float(entry["durationSeconds"]) < REFERENCE_MAX_SECONDS:
+                looped = directory / f".mureka-{reference_audio_name()}"
+                try:
+                    await loop_reference_audio(path, looped)
+                except ValueError as exc:
+                    raise GenerationError(f"Mureka 参考音频处理失败：{exc}") from exc
             try:
                 with (looped or path).open("rb") as handle:
                     response = await self._client.post(
@@ -1208,7 +1227,6 @@ class MurekaMusicProvider:
         file_id = data.get("id") if isinstance(data, dict) else None
         if not isinstance(file_id, str) or not file_id:
             raise GenerationError("Mureka 参考音频上传失败：接口未返回文件 id。")
-        self._reference_files[reference_id] = file_id
         return file_id
 
     async def generate(
@@ -1244,6 +1262,8 @@ class MurekaMusicProvider:
                 "n": 1,
             }
             if reference is not None:
+                if progress:
+                    await progress("preparing_reference", None, None)
                 # Docs list reference_id + vocal_id and prompt + vocal_id as combinations;
                 # prompt + reference_id is unverified and needs a live check.
                 request_body["reference_id"] = await self._reference_file_id(reference.song_id)

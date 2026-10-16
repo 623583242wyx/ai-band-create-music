@@ -87,6 +87,7 @@ from app.services.references import (
     new_reference_entry,
     prepare_reference_audio,
     reference_audio_name,
+    reference_lock,
     references_dir,
     save_references,
 )
@@ -571,7 +572,6 @@ def create_app(
             * 1024,
         },
     )
-    application.state.reference_lock = asyncio.Lock()
 
     @application.get("/api/health")
     async def health(request: Request) -> dict[str, object]:
@@ -974,15 +974,31 @@ def create_app(
             entry = new_reference_entry(prepared.stem, name, duration, prepared.name)
             entry["provider"] = provider
             entry["localOnly"] = True
-            async with request.app.state.reference_lock:
+            entry["sha256"] = hashlib.sha256(prepared.read_bytes()).hexdigest()
+            async with reference_lock(application_settings.output_dir):
                 existing = load_references(application_settings.output_dir)
-                save_references(
-                    application_settings.output_dir,
-                    [entry, *existing],
-                )
-            registered = True
+                duplicate = None
+                for old in existing:
+                    if old.get("provider") != provider:
+                        continue
+                    audio = directory / Path(str(old.get("audio") or "")).name
+                    if not audio.is_file():
+                        continue
+                    digest = old.get("sha256") or hashlib.sha256(audio.read_bytes()).hexdigest()
+                    if digest == entry["sha256"]:
+                        duplicate = old
+                        break
+                if duplicate is not None:
+                    entry = duplicate
+                    if "sha256" not in entry:
+                        entry["sha256"] = digest
+                        save_references(application_settings.output_dir, existing)
+                else:
+                    save_references(application_settings.output_dir, [entry, *existing])
+                    registered = True
             return JSONResponse(
-                status_code=status.HTTP_201_CREATED, content=_reference_response(entry, request)
+                status_code=status.HTTP_201_CREATED if registered else status.HTTP_200_OK,
+                content=_reference_response(entry, request),
             )
         finally:
             await file.close()
@@ -1000,7 +1016,7 @@ def create_app(
         request: Request,
         provider: Literal["elevenlabs_music", "mureka_music"] = "elevenlabs_music",
     ):
-        async with request.app.state.reference_lock:
+        async with reference_lock(application_settings.output_dir):
             existing = load_references(application_settings.output_dir)
             entry = next(
                 (

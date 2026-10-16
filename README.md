@@ -72,7 +72,12 @@ ElevenLabs 直接接收完整的结构化歌词和扩充风格标签，由模型
   chunk 加入 `conditioning_ref` 和 `condition_strength`
   （`ELEVENLABS_REFERENCE_CONDITION_STRENGTH`，默认 `medium`），最后以 `composition_plan`
   调用 stream 接口；Mureka 使用 `POST /v1/files/upload` 的 `purpose=reference`，短于 30 秒时会先在本地循环补足。
-  provider 返回的远端 id 只在当前进程缓存，重启后首次生成会重新上传。
+  provider 返回的远端 id 持久化到本地索引，重启后继续复用；文件锁保证共享同一输出目录的
+  进程不会并发重复上传。同一服务商下相同内容的本地参考也会复用，Mureka 和 ElevenLabs 仍相互隔离。
+  ElevenLabs 不足 10 秒的参考会先循环补至 30 秒；本地仍接受至少 3 秒的音频。
+  生成时会先报告参考音频准备阶段，首次上传仍可能按服务商规则计费。
+  缓存与服务商地址、API 凭据绑定，变更后会重新上传；凭据只保存不可逆摘要，不写入索引原文。
+  若进程在远端已受理、但本地索引尚未写回时崩溃，仍可能再次上传；目前上游未使用幂等键。
 - 单文件上限 `AUDIO_REFERENCE_MAX_UPLOAD_MB`（默认 30 MB），参考至少 3 秒。
 
 自部署 MiniMax Music 3 使用兼容的 `/v1/audio/jobs` 接口：
