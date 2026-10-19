@@ -2967,7 +2967,7 @@ def create_app(
                 if is_expired(job, application_settings.song_retention_days):
                     raise HTTPException(status_code=404, detail="歌曲已过期。")
         preview_match = (
-            re.fullmatch(r"(.+)\.playback-\d+-\d+\.mp3", target.name)
+            re.fullmatch(r"(.+)\.playback-(?:cbr192-)?\d+-\d+\.mp3", target.name)
             if target.parent.name == "playtrack"
             else None
         )
@@ -3020,7 +3020,7 @@ def create_app(
                 f"public, max-age={cache_seconds if expiry else 31536000}, immutable"
                 if len(relative.parts) >= 2
                 and relative.parts[-2] == "playtrack"
-                and re.fullmatch(r".+\.playback-\d+-\d+\.mp3", target.name)
+                and re.fullmatch(r".+\.playback-(?:cbr192-)?\d+-\d+\.mp3", target.name)
                 and (expiry is not None or not retention_enforced(application_settings))
                 else "no-store"
             ),

@@ -653,6 +653,8 @@ WAV 对应的 MP3 位于同歌曲的 `playtrack/` 下，文件名包含 WAV 的�
 读取结果会复用磁盘上的当前版本，即使旧元数据遗漏了 `playback`，也不会重新编码。
 没有有效 MP3 时不返回对应地址。音频从现有 `/output/` 出口下载，支持 Range 和查询参数；
 WAV 被软删除或版本改变后，其旧 MP3 链接返回 404，撤回删除会恢复有效地址。
+试听 MP3 固定用 CBR192 编码，文件名带 `cbr192` 版本标记；旧版 VBR 试听不再发布（链接
+返回 404），旧任务在重新分轨/替换/合轨生成新试听前回落到 WAV。
 
 兼容例外：旧任务的 `fullTrack`（或旧单轨字段）可能本来就是 MP3。
 后端保留该地址，并把它同步投影到对应的 `playback` 字段，不改写旧任务的原始引用。
@@ -770,7 +772,7 @@ SSE 保存阶段快照，队列最多 16 帧；慢客户端积压时丢弃最旧
   "id": "recording_0123456789abcdef0123456789abcdef",
   "name": "我的和声",
   "audioUrl": "http://localhost:8000/output/jobs/job-id/song_1/recording_0123456789abcdef0123456789abcdef.wav",
-  "playbackUrl": "http://localhost:8000/output/jobs/job-id/song_1/playtrack/recording_0123456789abcdef0123456789abcdef.playback-<version>.mp3",
+  "playbackUrl": "http://localhost:8000/output/jobs/job-id/song_1/playtrack/recording_0123456789abcdef0123456789abcdef.playback-cbr192-<mtime_ns>-<size>.mp3",
   "durationSeconds": 12.5,
   "waveform": [0.2, 0.7, 0.4],
   "audioRevision": 2
