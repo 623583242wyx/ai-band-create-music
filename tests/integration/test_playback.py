@@ -35,31 +35,47 @@ def wav(path: Path) -> None:
 
 async def test_preview_uses_constant_bitrate_for_firefox_seeking(tmp_path: Path) -> None:
     source = tmp_path / "guitar.wav"
-    samples = array.array("h", (
-        int(8000 * math.sin(index * 440 * 2 * math.pi / 44100))
-        if index < 44100 else 0
-        for index in range(88200)
-    ))
+    samples = array.array(
+        "h",
+        (
+            int(8000 * math.sin(index * 440 * 2 * math.pi / 44100)) if index < 44100 else 0
+            for index in range(88200)
+        ),
+    )
     with wave.open(str(source), "wb") as output:
         output.setparams((1, 2, 44100, 0, "NONE", "not compressed"))
         output.writeframes(samples.tobytes())
     preview = await make_playback_mp3(source, tmp_path)
     assert preview is not None
     probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "stream=bit_rate", "-of", "json",
-         str(tmp_path / preview)],
-        check=True, capture_output=True, text=True,
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=bit_rate",
+            "-of",
+            "json",
+            str(tmp_path / preview),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
     )
     assert json.loads(probe.stdout)["streams"][0]["bit_rate"] == "192000"
 
 
-async def test_legacy_vbr_preview_is_replaced_without_reusing_its_cached_url(tmp_path: Path) -> None:
+async def test_legacy_vbr_preview_is_replaced_without_reusing_its_cached_url(
+    tmp_path: Path,
+) -> None:
     settings = make_settings(tmp_path)
     source = settings.output_dir / "jobs/j/song_1/guitar.wav"
     wav(source)
     version = source.stat()
-    old = source.parent / "playtrack" / (
-        f"{source.stem}.playback-{version.st_mtime_ns}-{version.st_size}.mp3"
+    old = (
+        source.parent
+        / "playtrack"
+        / (f"{source.stem}.playback-{version.st_mtime_ns}-{version.st_size}.mp3")
     )
     old.parent.mkdir()
     old.write_bytes(b"ID3-legacy-vbr")
@@ -76,7 +92,8 @@ async def test_legacy_vbr_preview_is_replaced_without_reusing_its_cached_url(tmp
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app), base_url="http://testserver"
     ) as client:
-        assert (await client.get(f"/output/{old.relative_to(settings.output_dir)}")).status_code == 404
+        legacy_url = f"/output/{old.relative_to(settings.output_dir)}"
+        assert (await client.get(legacy_url)).status_code == 404
     fresh = await make_playback_mp3(source, settings.output_dir)
     assert fresh is not None and fresh != old.relative_to(settings.output_dir).as_posix()
     assert ".playback-cbr192-" in fresh
