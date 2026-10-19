@@ -36,7 +36,7 @@ def _encoder_gate() -> asyncio.Semaphore:
 
 def _playback_name(source: Path) -> str:
     version = source.stat()
-    return f"{source.stem}.playback-{version.st_mtime_ns}-{version.st_size}.mp3"
+    return f"{source.stem}.playback-cbr192-{version.st_mtime_ns}-{version.st_size}.mp3"
 
 
 async def make_playback_mp3(source: Path, output_dir: Path) -> str | None:
@@ -78,8 +78,9 @@ async def _encode_playback_mp3(source: Path, output_dir: Path) -> str | None:
             str(source),
             "-codec:a",
             "libmp3lame",
-            "-q:a",
-            "2",
+            # Firefox can become silent after seeking these VBR previews.
+            "-b:a",
+            "192k",
             "-f",
             "mp3",
             str(temporary),
