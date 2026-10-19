@@ -298,6 +298,11 @@ class GenerationOrchestrator:
                             else "Mureka 正在生成，总时长待确定"
                         )
                         message = f"第 {song_number}/{effective_count} 首：{detail}"
+                    if stage == "preparing_reference":
+                        detail = "正在准备参考音频"
+                        if selected_provider == "elevenlabs_music":
+                            detail += "；首次上传及版权检测按服务商规则计费，已上传则复用"
+                        message = f"第 {song_number}/{effective_count} 首：{detail}"
                     if received_audio_seconds is not None:
                         message = (
                             f"第 {song_number}/{effective_count} 首："

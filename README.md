@@ -17,6 +17,11 @@ AI 音乐生成与 RVC 人声替换的纯 FastAPI 后端。项目使用 `uv` 固
 
 ## 安装
 
+开发、运行和测试均以 Linux 为支持平台（`uv` 已限定 `sys_platform == 'linux'`）。
+Windows 请在 WSL2 的 Linux 环境或 Linux 容器中执行以下命令和 `uv run pytest`；
+不支持在原生 Windows Python 中直接安装或收集测试。参考音频的跨进程去重依赖 POSIX
+`fcntl` 文件锁，不提供仅进程内锁的降级，以保持并发上传的去重保证。
+
 项目固定使用 Python 3.10：
 
 ```bash
@@ -72,8 +77,16 @@ ElevenLabs 直接接收完整的结构化歌词和扩充风格标签，由模型
   chunk 加入 `conditioning_ref` 和 `condition_strength`
   （`ELEVENLABS_REFERENCE_CONDITION_STRENGTH`，默认 `medium`），最后以 `composition_plan`
   调用 stream 接口；Mureka 使用 `POST /v1/files/upload` 的 `purpose=reference`，短于 30 秒时会先在本地循环补足。
-  provider 返回的远端 id 只在当前进程缓存，重启后首次生成会重新上传。
+  provider 返回的远端 id 持久化到本地索引，重启后继续复用；文件锁保证共享同一输出目录的
+  进程不会并发重复上传。同一服务商下相同内容的本地参考也会复用，Mureka 和 ElevenLabs 仍相互隔离。
+  ElevenLabs 不足 10 秒的参考会先循环补至 30 秒；本地仍接受至少 3 秒的音频。
+  生成时会先报告参考音频准备阶段，首次上传仍可能按服务商规则计费。
+  缓存与服务商地址、API 凭据绑定，变更后会重新上传；凭据只保存不可逆摘要，不写入索引原文。
+  若进程在远端已受理、但本地索引尚未写回时崩溃，仍可能再次上传；目前上游未使用幂等键。
 - 单文件上限 `AUDIO_REFERENCE_MAX_UPLOAD_MB`（默认 30 MB），参考至少 3 秒。
+  部署时还需对齐网关/反向代理的请求体限制，并为 multipart 边界和字段开销预留余量；
+  例如后端为 30 MB 时，nginx 可设置 `client_max_body_size 32m;`，其它代理层也需同步检查。
+  若小于后端上限的文件仍返回 413，应检查网关限制，不能只调整应用配置。
 
 自部署 MiniMax Music 3 使用兼容的 `/v1/audio/jobs` 接口：
 
