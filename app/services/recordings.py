@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import wave
 from pathlib import Path
 
@@ -47,4 +48,92 @@ async def prepare_recording_audio(source: Path, target: Path, max_seconds: int) 
         raise ReferenceInputError("录音没有可播放的音频内容。")
     if duration > max_seconds:
         raise ReferenceInputError(f"录音时长不能超过 {max_seconds} 秒。")
+    return duration
+
+
+def recording_position_editable(project: dict, stem: str) -> bool:
+    return bool(project.get("replacedVocal")) or not any(
+        track.get("id") == stem for track in (project.get("mixConfig") or {}).get("tracks", [])
+    )
+
+
+def move_recording_audio(
+    source: Path,
+    target: Path,
+    position: float,
+    clip: dict | None,
+    song_duration: float,
+    max_seconds: float,
+    waveform: list[float] | None = None,
+) -> dict:
+    """Move exactly the retained PCM samples; never accumulate padding across moves."""
+    with wave.open(str(source), "rb") as audio:
+        rate = audio.getframerate()
+        old_position = (clip or {}).get("position", 0)
+        duration = (clip or {}).get("duration", audio.getnframes() / rate)
+        if not all(
+            math.isfinite(value) for value in (position, old_position, duration, song_duration)
+        ):
+            raise ReferenceInputError("请输入有效的放置位置。")
+        start, frames, offset = (
+            round(old_position * rate),
+            round(duration * rate),
+            round(position * rate),
+        )
+        if position < 0 or frames <= 0 or start < 0 or start + frames > audio.getnframes():
+            raise ReferenceInputError("录音片段无效，请重新打开工程。")
+        if offset + frames > round(min(song_duration, max_seconds) * rate):
+            raise ReferenceInputError("录音超出歌曲结尾，请向左移动。")
+        clip_waveform = (clip or {}).get("waveform")
+        if clip_waveform is None and waveform is not None:
+            count = len(waveform)
+            clip_waveform = waveform[
+                math.floor(start / audio.getnframes() * count) : math.ceil(
+                    (start + frames) / audio.getnframes() * count
+                )
+            ]
+        audio.setpos(start)
+        with wave.open(str(target), "wb") as output:
+            output.setparams(audio.getparams())
+            frame_bytes = audio.getnchannels() * audio.getsampwidth()
+            remaining = offset
+            while remaining:
+                count = min(remaining, 65536)
+                output.writeframesraw(bytes(count * frame_bytes))
+                remaining -= count
+            remaining = frames
+            while remaining:
+                count = min(remaining, 65536)
+                data = audio.readframes(count)
+                if len(data) != count * frame_bytes:
+                    raise ReferenceInputError("录音文件不完整，请重新打开工程。")
+                output.writeframesraw(data)
+                remaining -= count
+    result = {"position": offset / rate, "duration": frames / rate}
+    if clip_waveform is not None:
+        # Moving changes silence padding, never the retained clip's waveform bins.
+        result["waveform"] = clip_waveform
+    return result
+
+
+async def recording_song_duration(source: Path) -> float:
+    """Read the actual master, including MP3 jobs with absent or estimated duration hints."""
+    output = await run_audio_command(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(source),
+        ],
+        await asyncio.to_thread(prepare_ffmpeg_environment),
+        "无法读取歌曲时长，请重新打开工程。",
+        capture=True,
+    )
+    duration = float(output.strip())
+    if not math.isfinite(duration) or duration <= 0:
+        raise ReferenceInputError("无法读取歌曲时长，请重新打开工程。")
     return duration

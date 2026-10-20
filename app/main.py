@@ -12,6 +12,7 @@ import shutil
 import stat
 import tempfile
 import unicodedata
+import wave
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -43,6 +44,7 @@ from app.schemas import (
     GenerateRequest,
     GenerateResponse,
     GenerationJobResponse,
+    RecordingPositionRequest,
     RecordingUploadResponse,
     TrackMixRequest,
     UpdateGenerationJobRequest,
@@ -76,7 +78,12 @@ from app.services.providers import (
     AudioReference,
     create_music_provider,
 )
-from app.services.recordings import prepare_recording_audio
+from app.services.recordings import (
+    move_recording_audio,
+    prepare_recording_audio,
+    recording_position_editable,
+    recording_song_duration,
+)
 from app.services.references import (
     REFERENCE_DIR,
     REFERENCE_MAX_SECONDS,
@@ -565,8 +572,7 @@ def create_app(
         default_limit=application_settings.request_max_bytes,
         # Multipart framing adds a little on top of the audio file itself.
         path_limits={
-            "/api/references": application_settings.audio_reference_max_upload_bytes
-            + 1024 * 1024,
+            "/api/references": application_settings.audio_reference_max_upload_bytes + 1024 * 1024,
             "/api/jobs/*/recordings": (application_settings.recording_max_upload_mb + 1)
             * 1024
             * 1024,
@@ -2064,6 +2070,12 @@ def create_app(
                     for track in mix.tracks
                     if track.stemId in result.get("stemNames", {}) and track.id in target["stems"]
                 }
+                target["recordingClips"] = {
+                    track.id: result["recordingClips"][track.stemId]
+                    for track in mix.tracks
+                    if track.stemId in result.get("recordingClips", {})
+                    and track.id in target["stems"]
+                }
                 target["splitEnabled"] = split
                 playback = {}
                 if previews[0]:
@@ -2421,6 +2433,11 @@ def create_app(
                     relative = target.relative_to(application_settings.output_dir).as_posix()
                     result.setdefault("stems", {})[stem_id] = relative
                     result.setdefault("stemNames", {})[stem_id] = name
+                    result.setdefault("recordingClips", {})[stem_id] = {
+                        "position": 0,
+                        "duration": duration,
+                        "waveform": waveforms.get(stem_id, []),
+                    }
                     result["stemUrls"] = list(result["stems"].values())
                     result.setdefault("waveforms", {}).update(waveforms)
                     if preview_path:
@@ -2457,6 +2474,123 @@ def create_app(
                 for path in created:
                     path.unlink(missing_ok=True)
             await file.close()
+            if capacity is not None:
+                await capacity.release()
+
+    @application.patch("/api/jobs/{job_id}/stems/{stem_name}", response_model=GenerationJobResponse)
+    async def move_recording(
+        job_id: str,
+        stem_name: str,
+        request: Request,
+        body: RecordingPositionRequest,
+        song: int = 0,
+        variant: Literal["original", "mixed"] = "original",
+    ):
+        def selected():
+            job = retained_job(request, job_id)
+            if job is None or song not in (0, 1):
+                raise HTTPException(404, "歌曲不存在。")
+            output = _song_result(job, song)
+            result = song_project(output, variant)
+            if job.status != "succeeded" or result is None:
+                raise HTTPException(409, "歌曲尚未就绪。")
+            if not re.fullmatch(
+                r"recording_[A-Za-z0-9_]+", stem_name
+            ) or stem_name not in result.get("stems", {}):
+                raise HTTPException(404, "自定义音轨不存在。")
+            conflict = _mix_conflict(job)
+            if conflict is not None:
+                raise HTTPException(409, "工程正在处理音频，请稍后重试。")
+            require_audio_revision(result, request.headers.get("X-Audio-Revision"))
+            if not recording_position_editable(result, stem_name):
+                raise HTTPException(409, "录音已随创作固定，替换人声后可重新调整。")
+            return job, output, result
+
+        created = []
+        capacity = None
+        registered = False
+        try:
+            job, output, result = selected()
+            revision = result.get("audioRevision", 0)
+            source_url = result["stems"][stem_name]
+            source = _output_path_from_url(source_url, application_settings)
+            capacity = _orchestrator(request).capacity
+            try:
+                await capacity.acquire()
+            except CapacityExceededError:
+                capacity = None
+                raise HTTPException(429, "当前音频处理任务过多，请稍后重试。") from None
+            song_duration = await recording_song_duration(
+                _output_path_from_url(result["fullTrack"], application_settings)
+            )
+            with tempfile.TemporaryDirectory(prefix=".recording-", dir=source.parent) as staging:
+                prepared = Path(staging) / f"{stem_name}_{uuid4().hex}.wav"
+                clip = await asyncio.to_thread(
+                    move_recording_audio,
+                    source,
+                    prepared,
+                    body.position,
+                    result.get("recordingClips", {}).get(stem_name),
+                    song_duration,
+                    application_settings.max_duration_minutes * 60,
+                    result.get("waveforms", {}).get(stem_name),
+                )
+                waveforms = await extract_waveforms({stem_name: prepared})
+                preview = await make_playback_mp3(prepared, application_settings.output_dir)
+                if not preview:
+                    raise HTTPException(500, "试听音频生成失败，原位置已保留，请重试。")
+                current_job, _, current = selected()
+                if (
+                    current_job is not job
+                    or current is not result
+                    or current["stems"][stem_name] != source_url
+                    or current.get("audioRevision", 0) != revision
+                ):
+                    raise HTTPException(409, "歌曲版本已更新，请刷新后重试。")
+                target = source.parent / prepared.name
+                prepared.replace(target)
+                created.append(target)
+                preview_source = application_settings.output_dir / preview
+                preview_path = source.parent / "playtrack" / preview_source.name
+                preview_path.parent.mkdir(exist_ok=True)
+                preview_source.replace(preview_path)
+                created.append(preview_path)
+                previous = copy.deepcopy(result)
+                try:
+                    result["stems"][stem_name] = target.relative_to(
+                        application_settings.output_dir
+                    ).as_posix()
+                    result["stemUrls"] = list(result["stems"].values())
+                    result.setdefault("recordingClips", {})[stem_name] = clip
+                    result.setdefault("waveforms", {}).update(waveforms)
+                    _playback_dict(result).setdefault("stems", {})[stem_name] = (
+                        preview_path.relative_to(application_settings.output_dir).as_posix()
+                    )
+                    result["audioRevision"] = revision + 1
+                    job.save(application_settings.output_dir)
+                except BaseException:
+                    result.clear()
+                    result.update(previous)
+                    raise
+                registered = True
+            _publish_job(job, request, snapshot=True)
+            return await _async_job_response(job, request, application_settings)
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code, content={"success": False, "message": exc.detail}
+            )
+        except ReferenceInputError as exc:
+            return JSONResponse(status_code=400, content={"success": False, "message": str(exc)})
+        except (GenerationError, OSError, ValueError, wave.Error):
+            logger.exception("recording alignment failed job_id=%s", job_id)
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "message": "录音位置保存失败，原位置已保留。"},
+            )
+        finally:
+            if not registered:
+                for path in created:
+                    path.unlink(missing_ok=True)
             if capacity is not None:
                 await capacity.release()
 
@@ -2805,6 +2939,8 @@ def create_app(
         }
         if stem_name in result.get("stemNames", {}):
             deleted_entry["name"] = result["stemNames"].pop(stem_name)
+        if stem_name in result.get("recordingClips", {}):
+            deleted_entry["clip"] = result["recordingClips"].pop(stem_name)
         playback = result.get("playback")
         stem_playback = playback.get("stems") if isinstance(playback, dict) else None
         if isinstance(stem_playback, dict):
@@ -2915,6 +3051,8 @@ def create_app(
         result["stems"] = dict(items)
         if isinstance(deleted.get("name"), str):
             result.setdefault("stemNames", {})[stem_name] = deleted["name"]
+        if isinstance(deleted.get("clip"), dict):
+            result.setdefault("recordingClips", {})[stem_name] = deleted["clip"]
         if isinstance(deleted.get("playback"), str):
             _playback_dict(result).setdefault("stems", {})[stem_name] = deleted["playback"]
         result["stemUrls"] = list(result["stems"].values())
