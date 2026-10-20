@@ -1,0 +1,39 @@
+name: ${COMPOSE_PROJECT_NAME:-shuji-music}
+
+services:
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+        SOURCE_REVISION: ${SOURCE_REVISION:-unknown}
+    image: ai-band-generate-module:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    init: true
+    env_file:
+      - ${MUSIC_ENV_FILE:-../.env}
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8010
+      OUTPUT_DIR: /app/output
+      BS_ROFORMER_MODELS_DIR: /app/output/.bs-roformer-models
+      DEPLOYMENT_ENVIRONMENT: ${COMPOSE_PROJECT_NAME:-shuji-music}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${APP_PORT:-8010}:8010"
+    volumes:
+      - "music-output:/app/output"
+      - "${MUSIC_ASSETS_DIR:-../assets/rvc}:/app/assets/rvc:ro"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  music-output:

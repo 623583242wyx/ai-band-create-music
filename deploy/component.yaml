@@ -1,0 +1,51 @@
+# 组件元数据供统一部署与整套发布使用；当前 3199 尚未加载音乐适配器。
+apiVersion: deployment.shuji.dev/v1alpha1
+kind: Component
+metadata:
+  id: music
+  label: 音乐生成服务
+spec:
+  builds:
+    runtime:
+      context: .
+      dockerfile: Dockerfile
+      baseImagePolicy: python-310-cuda
+  services:
+    api:
+      build: runtime
+      ports:
+        http: {containerPort: 8010, protocol: http}
+      env:
+        OUTPUT_DIR: /app/output
+        BS_ROFORMER_MODELS_DIR: /app/output/.bs-roformer-models
+      health:
+        live: {type: http, port: http, path: /health/live}
+        ready:
+          type: http
+          port: http
+          path: /health/ready
+          jsonEquals: {status: ready}
+      stopGracePeriodSeconds: 60
+  dependencies:
+    llm:
+      type: inference
+      capability: chat-completions
+      required: false
+      endpointInject: services.api.env.LLM_BASE_URL
+      modelInject: services.api.env.LLM_MODEL
+      credentialInject: services.api.env.LLM_API_KEY
+    music_provider:
+      type: external
+      capability: music-generation
+      required: false
+  storage:
+    data:
+      service: api
+      mountPath: /app/output
+      scope: environment
+      writable: true
+      onRemove: retain
+  lifecycle:
+    strategy: stateful
+    update: require-stopped
+    rollback: require-artifact-compatibility

@@ -667,6 +667,50 @@ def create_app(
         except GenerationError as exc:
             return JSONResponse(status_code=502, content={"success": False, "message": str(exc)})
 
+    @application.get("/health/live")
+    async def deployment_live() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @application.get("/health/ready")
+    async def deployment_ready() -> JSONResponse:
+        checks = {"output": False, "provider": False}
+        try:
+            application_settings.output_dir.mkdir(parents=True, exist_ok=True)
+            probe = application_settings.output_dir / ".write-probe"
+            probe.write_text("", encoding="utf-8")
+            probe.unlink()
+            checks["output"] = True
+        except OSError:
+            pass
+        if application_settings.music_api_mode == "mock":
+            checks["provider"] = True
+        elif application_settings.music_provider == "minimax_music":
+            checks["provider"] = bool(application_settings.minimax_base_url)
+        elif application_settings.music_provider == "mureka_music":
+            secret = application_settings.mureka_api_key
+            checks["provider"] = bool(secret and secret.get_secret_value())
+        elif application_settings.music_provider == "elevenlabs_music":
+            secret = application_settings.elevenlabs_api_key
+            checks["provider"] = bool(secret and secret.get_secret_value())
+        else:
+            checks["provider"] = bool(application_settings.music_api_base_url)
+        ready = all(checks.values())
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={"status": "ready" if ready else "not_ready", "checks": checks},
+        )
+
+    @application.get("/version")
+    async def deployment_version() -> dict[str, object]:
+        return {
+            "component": "music",
+            "revision": os.getenv("SOURCE_REVISION", "unknown"),
+            "recipe": "music-container-v1",
+            "environment": os.getenv("DEPLOYMENT_ENVIRONMENT", "unmanaged"),
+            "mode": application_settings.music_api_mode,
+            "provider": application_settings.music_provider,
+        }
+
     @application.post(
         "/api/generate",
         response_model=GenerateResponse,

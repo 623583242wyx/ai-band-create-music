@@ -24,6 +24,7 @@ FROM python:3.10-slim-bookworm
 
 ARG APP_UID=1000
 ARG APP_GID=1000
+ARG SOURCE_REVISION=unknown
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
@@ -33,7 +34,11 @@ RUN apt-get update \
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    SOURCE_REVISION=${SOURCE_REVISION}
+LABEL org.opencontainers.image.source="https://github.com/WILLYYDS/ai-band-create-music" \
+    dev.shuji.deployment-contract="music-v1" \
+    org.opencontainers.image.revision=${SOURCE_REVISION}
 WORKDIR /app
 
 COPY --from=builder --chown=${APP_UID}:${APP_GID} /app/.venv /app/.venv
@@ -45,6 +50,6 @@ USER app
 EXPOSE 8010
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/api/health', timeout=5)"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8010/health/live', timeout=5)"
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8010", "--workers", "1"]
