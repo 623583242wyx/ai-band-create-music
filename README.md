@@ -810,13 +810,18 @@ const recording = await response.json();
 保存后移动录音调用 `PATCH /api/jobs/{jobId}/stems/{recordingId}?song=0&variant=original`，
 JSON 请求体为 `{"position": 12.5}`（秒），携带当前 `X-Audio-Revision`。
 仅支持录音轨，位置必须保证完整片段位于歌曲时长与配置上限以内；成功返回完整任务快照，
-`audioRevision` 加 1，`recordingClips[id]` 保存 `{position, duration, waveform}`。
-移动时按上一位置提取原始 PCM 片段并重新添加前置静音，不累积偏移或重新压缩 WAV；
+`audioRevision` 加 1，`recordingClips[id]` 保存 `{position, duration, waveform, source}`。
+上传时在 `recording_sources/` 保留独立、不可变的 PCM WAV（`source` 为其相对路径）。
+移动时从这份原始片段重新添加前置静音，不从带增益、限幅的合轨产物中截取，也不累积偏移或重新压缩 WAV；
 新 MP3 生成成功后才发布 WAV、预览及波形的新版本，失败保留旧音频。
 前端移动片段不改变整曲播放位置，重新播放前必须等待含录音轨的整组预加载完成。
 片段波形单独保存，移动后不随前置静音重新采样；位置、片段长度与波形随删除撤回、重启、候选/替换后歌曲及合轨保留。
-完成创作后，该成品已有录音的位置固定，移动请求返回 409；原曲产生新的待提交替换人声后可重新调整。
+仅在完成创作成功落盘时更新 `committedRecordingIds`；失败/取消不改变它，替换编辑器只更新替换后那首。
+成品中已提交录音的位置固定，移动请求返回 409；原曲产生新的待提交替换人声后可从原始 PCM 重新调整。
 完成创作后新增的录音仍可编排，直到下一次完成创作。
+移动成功后清理无引用的旧 WAV/MP3，仍被原曲、替换后歌曲、其它候选或撤回记录引用的文件继续保留。
+历史列表及轻量进度帧同时省略 `waveforms` 和片段 `waveform`；详情仍包含完整片段波形，空波形在后续移动时可从原始 PCM 恢复。
+旧版未提交录音首次移动时自动保留原始片段；已合轨且缺少原始 PCM 的老录音无法无损恢复，保持固定，需重新导入后才能重排。
 
 合轨继续调用 `/mix`，录音车道提交为
 `{"id":"recording_<id>","source":"stem","stemId":"recording_<id>","gainDb":0}`。

@@ -91,6 +91,7 @@ class ErrorResponse(BaseModel):
 
 
 class RecordingClip(BaseModel):
+    source: str | None = Field(default=None, exclude_if=lambda value: value is None)
     position: float = Field(ge=0, allow_inf_nan=False)
     duration: float = Field(gt=0, allow_inf_nan=False)
     waveform: list[float] | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -131,6 +132,9 @@ class MusicOutput(BaseModel):
     durationSeconds: float | None = None
     stems: dict[str, str]
     stemNames: dict[str, str] | None = Field(default=None, exclude_if=lambda value: value is None)
+    committedRecordingIds: list[str] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     recordingClips: dict[str, RecordingClip] | None = Field(
         default=None, exclude_if=lambda value: value is None
     )

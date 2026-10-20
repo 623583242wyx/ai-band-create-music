@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 import wave
 from pathlib import Path
 
@@ -51,9 +52,22 @@ async def prepare_recording_audio(source: Path, target: Path, max_seconds: int) 
     return duration
 
 
+def committed_recording_ids(project: dict) -> list[str]:
+    if project.get("committedRecordingIds") is not None:
+        return project["committedRecordingIds"] or []
+    # Legacy commits have rendered stem filenames, even if a later mixConfig failed.
+    return sorted(
+        stem
+        for stem, url in project.get("stems", {}).items()
+        if stem.startswith("recording_") and re.search(r"_v[0-9]+_[0-9a-f]{12}\.wav$", url)
+    )
+
+
 def recording_position_editable(project: dict, stem: str) -> bool:
-    return bool(project.get("replacedVocal")) or not any(
-        track.get("id") == stem for track in (project.get("mixConfig") or {}).get("tracks", [])
+    if stem not in committed_recording_ids(project):
+        return True
+    return bool(project.get("replacedVocal")) and bool(
+        project.get("recordingClips", {}).get(stem, {}).get("source")
     )
 
 
@@ -69,7 +83,7 @@ def move_recording_audio(
     """Move exactly the retained PCM samples; never accumulate padding across moves."""
     with wave.open(str(source), "rb") as audio:
         rate = audio.getframerate()
-        old_position = (clip or {}).get("position", 0)
+        old_position = 0 if (clip or {}).get("source") else (clip or {}).get("position", 0)
         duration = (clip or {}).get("duration", audio.getnframes() / rate)
         if not all(
             math.isfinite(value) for value in (position, old_position, duration, song_duration)
@@ -85,7 +99,7 @@ def move_recording_audio(
         if offset + frames > round(min(song_duration, max_seconds) * rate):
             raise ReferenceInputError("录音超出歌曲结尾，请向左移动。")
         clip_waveform = (clip or {}).get("waveform")
-        if clip_waveform is None and waveform is not None:
+        if not clip_waveform and waveform:
             count = len(waveform)
             clip_waveform = waveform[
                 math.floor(start / audio.getnframes() * count) : math.ceil(
@@ -113,6 +127,8 @@ def move_recording_audio(
     if clip_waveform is not None:
         # Moving changes silence padding, never the retained clip's waveform bins.
         result["waveform"] = clip_waveform
+    if (clip or {}).get("source"):
+        result["source"] = clip["source"]
     return result
 
 

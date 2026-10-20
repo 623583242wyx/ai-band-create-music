@@ -51,6 +51,7 @@ async def test_alignment_preserves_pcm_preview_restart_undo_and_committed_mix(tm
                 "position": start,
                 "duration": 0.5,
                 "waveform": take["waveform"],
+                "source": job.result["recordingClips"][stem]["source"],
             }
             shifted = await http.get(output["stems"][stem])
             _, _, data = samples(shifted.content)
@@ -111,6 +112,7 @@ async def test_alignment_preserves_pcm_preview_restart_undo_and_committed_mix(tm
             "position": 1.5,
             "duration": 0.5,
             "waveform": take["waveform"],
+            "source": job.result["recordingClips"][stem]["source"],
         }
     assert not list(settings.output_dir.rglob(".recording-*"))
     assert app.state.orchestrator.capacity.active == 0
@@ -187,6 +189,7 @@ async def test_alignment_changes_only_the_selected_candidate_and_variant(tmp_pat
             "position": 1.5,
             "duration": 0.5,
             "waveform": uploaded.json()["waveform"],
+            "source": project["recordingClips"][stem]["source"],
         }
     if song == 1:
         assert {key: value for key, value in job.result.items() if key != "alternatives"} == {
