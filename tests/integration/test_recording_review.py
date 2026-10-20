@@ -6,6 +6,7 @@ import pytest
 
 from app.core.errors import GenerationError
 from app.main import create_app
+from app.schemas import RecordingClip
 from tests.helpers import client, make_orchestrator
 from tests.integration.test_recording_api import recording_app
 from tests.integration.test_recording_position import samples
@@ -207,3 +208,32 @@ async def test_collecting_old_versions_preserves_other_candidate_references(tmp_
         assert (await move(http, job, stem, 0.5)).status_code == 200
         assert (settings.output_dir / old_audio).is_file()
         assert (settings.output_dir / old_preview).is_file()
+
+
+async def test_out_of_range_position_is_rejected_before_audio_work(tmp_path):
+    app, settings, job = recording_app(tmp_path)
+    async with client(app) as http:
+        take = await upload(http, tmp_path, settings, job)
+        response = await move(http, job, take["id"], 1e308)
+    assert response.status_code == 422
+    assert app.state.orchestrator.capacity.active == 0
+
+
+@pytest.mark.parametrize("kept", [True, False])
+async def test_mix_cleanup_keeps_only_referenced_recording_sources(tmp_path, kept):
+    app, settings, job = recording_app(tmp_path)
+    vocal = {"id": "vocal", "source": "stem", "stemId": "vocal", "gainDb": 0}
+    async with client(app) as http:
+        take = await upload(http, tmp_path, settings, job)
+        stem = take["id"]
+        source = settings.output_dir / job.result["recordingClips"][stem]["source"]
+        recording = {"id": stem, "source": "stem", "stemId": stem, "gainDb": 0}
+        await commit(http, job, [vocal, recording] if kept else [vocal])
+        assert job.mix_status == "succeeded"
+    # recording_sources is now scanned: a kept lane's PCM survives, a dropped lane's is removed.
+    assert source.is_file() is kept
+
+
+def test_a_malformed_stored_clip_does_not_break_the_job_response():
+    clip = RecordingClip.model_validate({"position": 0, "duration": 0})
+    assert clip.model_dump() == {"position": 0, "duration": 0}

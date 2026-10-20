@@ -151,8 +151,12 @@ def test_moving_a_padded_track_has_exact_bounds_and_rejects_invalid_pcm(tmp_path
     output = tmp_path / "output.wav"
     clip = move_recording_audio(source, output, 0.5, None, 1, 360)
     assert clip == {"position": 0.5, "duration": 0.5}
+    # MP3 preview padding can overshoot the master slightly; such drops snap to the end.
+    assert move_recording_audio(source, output, 0.53, None, 1, 360) == clip
+    with wave.open(str(output), "rb") as audio:
+        assert audio.getnframes() == audio.getframerate()
     with pytest.raises(ValueError):
-        move_recording_audio(source, output, 0.5001, None, 1, 360)
+        move_recording_audio(source, output, 0.56, None, 1, 360)
     with pytest.raises(ValueError):
         move_recording_audio(source, output, -1, None, 1, 360)
 

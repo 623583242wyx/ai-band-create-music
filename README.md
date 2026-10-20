@@ -809,7 +809,7 @@ const recording = await response.json();
 
 保存后移动录音调用 `PATCH /api/jobs/{jobId}/stems/{recordingId}?song=0&variant=original`，
 JSON 请求体为 `{"position": 12.5}`（秒），携带当前 `X-Audio-Revision`。
-仅支持录音轨，位置必须保证完整片段位于歌曲时长与配置上限以内；成功返回完整任务快照，
+仅支持录音轨，位置必须保证完整片段位于歌曲时长与配置上限以内（超出 50 ms 以内会吸附到结尾，以兼容 MP3 预览的编码填充；`position` 上限 86400 秒）；成功返回完整任务快照，
 `audioRevision` 加 1，`recordingClips[id]` 保存 `{position, duration, waveform, source}`。
 上传时在 `recording_sources/` 保留独立、不可变的 PCM WAV（`source` 为其相对路径）。
 移动时从这份原始片段重新添加前置静音，不从带增益、限幅的合轨产物中截取，也不累积偏移或重新压缩 WAV；

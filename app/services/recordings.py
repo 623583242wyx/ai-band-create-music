@@ -52,6 +52,9 @@ async def prepare_recording_audio(source: Path, target: Path, max_seconds: int) 
     return duration
 
 
+END_TOLERANCE_SECONDS = 0.05
+
+
 def committed_recording_ids(project: dict) -> list[str]:
     if project.get("committedRecordingIds") is not None:
         return project["committedRecordingIds"] or []
@@ -96,8 +99,15 @@ def move_recording_audio(
         )
         if position < 0 or frames <= 0 or start < 0 or start + frames > audio.getnframes():
             raise ReferenceInputError("录音片段无效，请重新打开工程。")
-        if offset + frames > round(min(song_duration, max_seconds) * rate):
-            raise ReferenceInputError("录音超出歌曲结尾，请向左移动。")
+        limit = round(min(song_duration, max_seconds) * rate)
+        if offset + frames > limit:
+            # Client timelines use MP3 previews, whose encoder padding can run slightly past the
+            # master; snap drops within that margin to the end instead of rejecting them.
+            if offset + frames - limit > round(END_TOLERANCE_SECONDS * rate):
+                raise ReferenceInputError("录音超出歌曲结尾，请向左移动。")
+            offset = limit - frames
+            if offset < 0:
+                raise ReferenceInputError("录音超出歌曲结尾，请向左移动。")
         clip_waveform = (clip or {}).get("waveform")
         if not clip_waveform and waveform:
             count = len(waveform)

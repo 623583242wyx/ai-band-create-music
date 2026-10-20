@@ -92,14 +92,16 @@ class ErrorResponse(BaseModel):
 
 class RecordingClip(BaseModel):
     source: str | None = Field(default=None, exclude_if=lambda value: value is None)
-    position: float = Field(ge=0, allow_inf_nan=False)
-    duration: float = Field(gt=0, allow_inf_nan=False)
+    # Read model: a malformed stored clip must not fail the whole job response.
+    position: float
+    duration: float
     waveform: list[float] | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class RecordingPositionRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    position: float = Field(ge=0, allow_inf_nan=False)
+    # Bounded so seconds * sample rate always fits an int; the song limit is checked later.
+    position: float = Field(ge=0, le=24 * 60 * 60, allow_inf_nan=False)
 
 
 class RecordingUploadResponse(BaseModel):

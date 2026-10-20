@@ -2424,7 +2424,7 @@ def create_app(
                 source_directory.mkdir(exist_ok=True)
                 original_source = source_directory / prepared.name
                 created.append(original_source)
-                shutil.copyfile(target, original_source)
+                await asyncio.to_thread(shutil.copyfile, target, original_source)
                 previous = copy.deepcopy(result)
                 try:
                     relative = target.relative_to(application_settings.output_dir).as_posix()
