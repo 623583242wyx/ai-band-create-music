@@ -168,7 +168,7 @@ def _has_lyric_text(text: str) -> bool:
 async def _detailed_music_audio(
     response: httpx.Response, metadata: dict[str, Any]
 ) -> AsyncIterator[bytes]:
-    """增量解析 ElevenLabs detailed 的 multipart，音频边收边写，不整包缓冲。"""
+    """增量解析 detailed multipart；按 part 的 Content-Type 选 JSON/音频，其它段跳过。"""
     content_type = response.headers.get("content-type", "")
     marker = "boundary="
     boundary = (
@@ -179,25 +179,49 @@ async def _detailed_music_audio(
     if not boundary:
         raise GenerationError("ElevenLabs 音乐生成失败：详细响应缺少 multipart boundary。")
     delimiter = f"--{boundary}".encode()
+    separator = b"\r\n" + delimiter
     buffer = b""
-    state = "json_headers"
+    state = "preamble"
     async for chunk in response.aiter_bytes():
         if not chunk:
             continue
         buffer += chunk
         while True:
-            if state == "json_headers":
+            if state == "preamble":
+                index = buffer.find(delimiter)
+                if index < 0:
+                    buffer = buffer[-len(delimiter) :]
+                    break
+                buffer = buffer[index + len(delimiter) :]
+                state = "after_boundary"
+            elif state == "after_boundary":
+                if len(buffer) < 2:
+                    break
+                if buffer.startswith(b"--"):
+                    return
+                index = buffer.find(b"\r\n")
+                if index < 0:
+                    break
+                buffer = buffer[index + 2 :]
+                state = "headers"
+            elif state == "headers":
                 index = buffer.find(b"\r\n\r\n")
                 if index < 0:
                     break
+                header = buffer[:index].lower()
                 buffer = buffer[index + 4 :]
-                state = "json_body"
-            elif state == "json_body":
-                index = buffer.find(b"\r\n" + delimiter)
+                if b"application/json" in header:
+                    state = "json"
+                elif b"audio/" in header or b"application/octet-stream" in header:
+                    state = "audio"
+                else:
+                    state = "skip"
+            elif state == "json":
+                index = buffer.find(separator)
                 if index < 0:
                     break
                 body = buffer[:index]
-                buffer = buffer[index + 2 + len(delimiter) :]
+                buffer = buffer[index + len(separator) :]
                 try:
                     parsed = json.loads(body.decode("utf-8"))
                 except (UnicodeDecodeError, ValueError) as exc:
@@ -209,26 +233,30 @@ async def _detailed_music_audio(
                         "ElevenLabs 音乐生成失败：详细响应元数据不是 JSON 对象。"
                     )
                 metadata.update(parsed)
-                state = "audio_headers"
-            elif state == "audio_headers":
-                index = buffer.find(b"\r\n\r\n")
+                state = "after_boundary"
+            elif state == "audio":
+                index = buffer.find(separator)
                 if index < 0:
+                    hold = len(separator)
+                    if len(buffer) > hold:
+                        yield buffer[:-hold]
+                        buffer = buffer[-hold:]
                     break
-                buffer = buffer[index + 4 :]
-                state = "audio"
-            else:
-                # 留出结尾 boundary 的长度，避免把分隔符写进音频。
-                hold = len(delimiter) + 8
-                if len(buffer) > hold:
-                    yield buffer[:-hold]
-                    buffer = buffer[-hold:]
-                break
-    if state != "audio":
-        raise GenerationError("ElevenLabs 音乐生成失败：详细响应结构无效。")
-    index = buffer.rfind(b"\r\n" + delimiter)
-    audio = buffer[:index] if index >= 0 else buffer
-    if audio:
-        yield audio
+                audio = buffer[:index]
+                if audio:
+                    yield audio
+                buffer = buffer[index + len(separator) :]
+                state = "after_boundary"
+            else:  # skip：时间戳/波形等附加段，不写进 WAV
+                index = buffer.find(separator)
+                if index < 0:
+                    buffer = buffer[-len(separator) :]
+                    break
+                buffer = buffer[index + len(separator) :]
+                state = "after_boundary"
+    if state == "preamble":
+        raise GenerationError("ElevenLabs 音乐生成失败：详细响应未找到 multipart boundary。")
+    raise GenerationError("ElevenLabs 音乐生成失败：详细响应结构无效。")
 
 
 def _detailed_music_text(metadata: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -1129,9 +1157,10 @@ class MiniMaxMusicProvider:
         del duration_seconds
         try:
             lyrics, _ = split_generation_prompt(user_prompt)
-            has_prepared_lyrics = bool(lyrics)
-            lyrics = _wrap_long_lyric_lines(lyrics) if has_prepared_lyrics else user_prompt
-            if has_prepared_lyrics and len(lyrics) < 10:
+            if not lyrics:
+                raise GenerationError("MiniMax 音乐生成失败：缺少歌词。")
+            lyrics = _wrap_long_lyric_lines(lyrics)
+            if len(lyrics) < 10:
                 raise GenerationError("MiniMax 音乐生成失败：生成的歌词不足 10 个字符。")
             target = _audio_target(
                 self._settings,
@@ -1150,17 +1179,16 @@ class MiniMaxMusicProvider:
             }
             if job_id:
                 request_body["jobId"] = uuid5(NAMESPACE_URL, f"{job_id}:{variation}").hex
-            if has_prepared_lyrics:
-                request_body["instructions"] += (
-                    "\n[Lyric Fidelity: Sing every supplied non-tag lyric line exactly once, "
-                    "verbatim, and in order. Never omit, repeat, paraphrase, invent, or replace "
-                    "any lyric words.]"
-                    "\n[Timing: Choose the natural complete song duration. Sing every supplied "
-                    "lyric without cutting off the ending, then stop all vocals and finish with "
-                    "only a short natural outro.]"
-                    "\n[Vocal Ending: Never fill unused time with repeated or invented vocals, "
-                    "humming, chants, ad-libs, or an extended instrumental outro.]"
-                )
+            request_body["instructions"] += (
+                "\n[Lyric Fidelity: Sing every supplied non-tag lyric line exactly once, "
+                "verbatim, and in order. Never omit, repeat, paraphrase, invent, or replace "
+                "any lyric words.]"
+                "\n[Timing: Choose the natural complete song duration. Sing every supplied "
+                "lyric without cutting off the ending, then stop all vocals and finish with "
+                "only a short natural outro.]"
+                "\n[Vocal Ending: Never fill unused time with repeated or invented vocals, "
+                "humming, chants, ad-libs, or an extended instrumental outro.]"
+            )
             url = f"{self._settings.minimax_base_url}{MINIMAX_GENERATE_PATH}"
             request_diagnostic = {
                 "method": "POST",
@@ -1431,7 +1459,9 @@ class MurekaMusicProvider:
         lyrics, _ = split_generation_prompt(user_prompt)
         song_title = None
         if not lyrics:
-            song_title, lyrics = await self._generate_lyrics(structured_prompt)
+            song_title, lyrics = await self._generate_lyrics(
+                structured_prompt[:MUREKA_PROMPT_MAX_CHARS]
+            )
         if len(lyrics) > MUREKA_LYRICS_MAX_CHARS:
             raise GenerationError(
                 f"Mureka 音乐生成失败：歌词长度 {len(lyrics)} 超过接口上限 "

@@ -105,6 +105,8 @@ ElevenLabs 直接接收完整的结构化歌词和扩充风格标签，由模型
 
 > MiniMax 功能暂时停止维护。收起页直传（`directPrompt=true`）会返回 400；
 > 展开页/AI-talk 的既有歌词路径保留但不再保证。建议使用 Mureka 或 ElevenLabs。
+> `Settings.music_provider` 的代码默认值仍是 `minimax_music` 以兼容旧部署；
+> 新部署请显式设置 `MUSIC_PROVIDER=mureka_music`（`.env.example` 已如此）。
 
 自部署 MiniMax Music 3 使用兼容的 `/v1/audio/jobs` 接口：
 

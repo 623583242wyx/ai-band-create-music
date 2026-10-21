@@ -366,9 +366,10 @@ class GenerationOrchestrator:
                     response["lyrics"] = lyrics
                     if music_result.debug.get("styleTruncated"):
                         note = "Mureka 风格说明超过 1024 字符，已截断"
-                        response["warning"] = "；".join(
-                            filter(None, [response.get("warning"), note])
-                        )
+                        if note not in (response.get("warning") or ""):
+                            response["warning"] = "；".join(
+                                filter(None, [response.get("warning"), note])
+                            )
                     if music_result.title or music_result.lyrics:
                         # job.json 与 prompts.json 都留下服务商返回的歌名/歌词。
                         update_job_diagnostics(

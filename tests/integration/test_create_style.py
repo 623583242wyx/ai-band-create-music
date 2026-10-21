@@ -164,6 +164,8 @@ async def test_mureka_truncates_long_raw_style_and_reports_it(tmp_path: Path):
             "风" * 1025, None, "风" * 1025
         )
 
+    lyrics_request = next(r for r in requests if r.url.path == "/v1/lyrics/generate")
+    assert len(json.loads(lyrics_request.content)["prompt"]) == 1024
     song_request = next(r for r in requests if r.url.path == "/v1/song/generate")
     assert len(json.loads(song_request.content)["prompt"]) == 1024
     assert result.debug["styleTruncated"] is True

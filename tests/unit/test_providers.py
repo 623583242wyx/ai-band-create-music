@@ -688,6 +688,16 @@ async def test_generic_provider_accepts_direct_audio_url(tmp_path: Path) -> None
     assert result.debug["mode"] == "direct_audio_url"
 
 
+async def test_minimax_provider_requires_prepared_lyrics(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail("MiniMax must not be called without prepared lyrics")
+
+    settings = make_settings(tmp_path, minimax_base_url="https://minimax.test")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match="缺少歌词"):
+            await MiniMaxMusicProvider(settings, client).generate("rock", None, "rock")
+
+
 async def test_minimax_provider_omits_duration_for_auto(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
@@ -1052,3 +1062,52 @@ async def test_mureka_loops_short_reference_to_30_seconds(tmp_path: Path) -> Non
     assert sorted(path.name for path in clip.parent.iterdir() if path.suffix != ".lock") == sorted(
         [clip.name, "index.json"]
     )
+
+async def test_elevenlabs_detailed_multipart_handles_preamble_and_extra_parts(
+    tmp_path: Path,
+) -> None:
+    pcm = b"\x00\x00\x01\x00" * 24_000
+    boundary = "music-boundary"
+    metadata = {
+        "song_metadata": {"title": "雨后"},
+        "composition_plan": {"chunks": [{"text": "[Verse]\n第一句"}]},
+    }
+    extra = {"words_timestamps": [{"word": "雨", "start_ms": 0}]}
+    body = (
+        b"preamble before the first boundary\r\n"
+        + f"--{boundary}\r\nContent-Type: audio/pcm\r\n\r\n".encode()
+        + pcm
+        + b"\r\n"
+        + f"--{boundary}\r\nContent-Type: application/json\r\n\r\n".encode()
+        + json.dumps(metadata, ensure_ascii=False).encode()
+        + b"\r\n"
+        + f"--{boundary}\r\nContent-Type: application/json\r\n\r\n".encode()
+        + json.dumps(extra, ensure_ascii=False).encode()
+        + b"\r\n"
+        + f"--{boundary}\r\nContent-Type: text/plain\r\n\r\n".encode()
+        + b"ignored extra part\r\n"
+        + f"--{boundary}--\r\n".encode()
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=ChunkedBody(body[:1], body[1:41], body[41:333], body[333:]),
+            headers={"content-type": f"multipart/mixed; boundary={boundary}"},
+        )
+
+    settings = make_settings(
+        tmp_path,
+        elevenlabs_api_key="secret",
+        elevenlabs_music_base_url="https://eleven.test",
+        elevenlabs_music_output_format="pcm_8000",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await ElevenLabsMusicProvider(settings, client).generate(
+            "[Genre: Folk]", 3, "温暖民谣", direct_prompt=True, job_id="multipart-job"
+        )
+
+    assert result.title == "雨后"
+    assert result.lyrics == "[Verse]\n第一句"
+    with wave.open(str(result.audio_path), "rb") as audio:
+        assert audio.readframes(audio.getnframes()) == pcm
