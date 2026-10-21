@@ -12,6 +12,7 @@ import shutil
 import stat
 import tempfile
 import unicodedata
+import wave
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -43,6 +44,7 @@ from app.schemas import (
     GenerateRequest,
     GenerateResponse,
     GenerationJobResponse,
+    RecordingPositionRequest,
     RecordingUploadResponse,
     TrackMixRequest,
     UpdateGenerationJobRequest,
@@ -76,7 +78,13 @@ from app.services.providers import (
     AudioReference,
     create_music_provider,
 )
-from app.services.recordings import prepare_recording_audio
+from app.services.recordings import (
+    committed_recording_ids,
+    move_recording_audio,
+    prepare_recording_audio,
+    recording_position_editable,
+    recording_song_duration,
+)
 from app.services.references import (
     REFERENCE_DIR,
     REFERENCE_MAX_SECONDS,
@@ -565,8 +573,7 @@ def create_app(
         default_limit=application_settings.request_max_bytes,
         # Multipart framing adds a little on top of the audio file itself.
         path_limits={
-            "/api/references": application_settings.audio_reference_max_upload_bytes
-            + 1024 * 1024,
+            "/api/references": application_settings.audio_reference_max_upload_bytes + 1024 * 1024,
             "/api/jobs/*/recordings": (application_settings.recording_max_upload_mb + 1)
             * 1024
             * 1024,
@@ -1353,8 +1360,8 @@ def create_app(
                 result.pop("replacedVocal", None)
                 result.pop("_replacedVocalModel", None)
                 # 旧方案的工程状态（编辑器控制与单轨原输入）按"未提交设置"丢弃。新版的
-                # mixConfig 是已提交成品的凭据，而重新分轨用的是同一份 fullTrack、成品仍然
-                # 成立，所以它照旧保留（文档：成功终态继续保留此配置）。
+                # mixConfig 是最近一次受理的合轨请求，照旧保留；录音锁定单独由
+                # committedRecordingIds 记录，重新分轨不改变已提交成品的录音身份。
                 drop_editor_state(result)
                 result["audioRevision"] = result.get("audioRevision", 0) + 1
                 invalidate_mix_artifact(job, result)
@@ -1913,22 +1920,9 @@ def create_app(
             _publish_job(job, request, snapshot=True)
 
         def cleanup_replaced_files() -> None:
-            referenced = set()
-            songs = [job.result, *(job.result.get("alternatives") or [])]
-            for output in [*songs, *filter(None, (song_project(item, "mixed") for item in songs))]:
-                urls = [output.get(key) for key in ("fullTrack", "mixedTrack", "replacedVocal")]
-                urls.extend(output.get("stems", {}).values())
-                playback = output.get("playback") or {}
-                urls.extend(
-                    playback.get(key) for key in ("fullTrack", "mixedTrack", "replacedVocal")
-                )
-                urls.extend((playback.get("stems") or {}).values())
-                for url in urls:
-                    if isinstance(url, str):
-                        try:
-                            referenced.add(_output_path_from_url(url, application_settings))
-                        except ValueError:
-                            pass
+            referenced = _referenced_output_paths(
+                [job.result, job.deleted_stems, job.deleted_replaced_vocals], application_settings
+            )
             # 软删除的落点有两处：第一首候选的分轨进 `.trash/{job}` 根，替换结果与其它候选进
             # `.trash/{job}/song_N`（见 _stem_trash_path / trash_result_path）。只扫 song_N
             # 会让第一首被删除的分轨永远留在回收站里；反过来扫根目录又可能删掉别的候选的
@@ -1946,6 +1940,7 @@ def create_app(
             for folder in (
                 directory,
                 directory / "playtrack",
+                directory / "recording_sources",
                 trash_root / directory.name,
                 *trash_folders,
             ):
@@ -2064,6 +2059,15 @@ def create_app(
                     for track in mix.tracks
                     if track.stemId in result.get("stemNames", {}) and track.id in target["stems"]
                 }
+                target["recordingClips"] = {
+                    track.id: result["recordingClips"][track.stemId]
+                    for track in mix.tracks
+                    if track.stemId in result.get("recordingClips", {})
+                    and track.id in target["stems"]
+                }
+                target["committedRecordingIds"] = sorted(
+                    stem for stem in target["stems"] if stem.startswith("recording_")
+                )
                 target["splitEnabled"] = split
                 playback = {}
                 if previews[0]:
@@ -2416,11 +2420,24 @@ def create_app(
                     preview_path.parent.mkdir(exist_ok=True)
                     staged_preview.replace(preview_path)
                     created.append(preview_path)
+                source_directory = directory / "recording_sources"
+                source_directory.mkdir(exist_ok=True)
+                original_source = source_directory / prepared.name
+                created.append(original_source)
+                await asyncio.to_thread(shutil.copyfile, target, original_source)
                 previous = copy.deepcopy(result)
                 try:
                     relative = target.relative_to(application_settings.output_dir).as_posix()
                     result.setdefault("stems", {})[stem_id] = relative
                     result.setdefault("stemNames", {})[stem_id] = name
+                    result.setdefault("recordingClips", {})[stem_id] = {
+                        "source": original_source.relative_to(
+                            application_settings.output_dir
+                        ).as_posix(),
+                        "position": 0,
+                        "duration": duration,
+                        "waveform": waveforms.get(stem_id, []),
+                    }
                     result["stemUrls"] = list(result["stems"].values())
                     result.setdefault("waveforms", {}).update(waveforms)
                     if preview_path:
@@ -2456,7 +2473,171 @@ def create_app(
             if not registered:
                 for path in created:
                     path.unlink(missing_ok=True)
+                for directory in {
+                    path.parent for path in created if path.parent.name == "recording_sources"
+                }:
+                    with suppress(OSError):
+                        directory.rmdir()
             await file.close()
+            if capacity is not None:
+                await capacity.release()
+
+    @application.patch("/api/jobs/{job_id}/stems/{stem_name}", response_model=GenerationJobResponse)
+    async def move_recording(
+        job_id: str,
+        stem_name: str,
+        request: Request,
+        body: RecordingPositionRequest,
+        song: int = 0,
+        variant: Literal["original", "mixed"] = "original",
+    ):
+        def selected():
+            job = retained_job(request, job_id)
+            if job is None or song not in (0, 1):
+                raise HTTPException(404, "歌曲不存在。")
+            output = _song_result(job, song)
+            result = song_project(output, variant)
+            if job.status != "succeeded" or result is None:
+                raise HTTPException(409, "歌曲尚未就绪。")
+            if not re.fullmatch(
+                r"recording_[A-Za-z0-9_]+", stem_name
+            ) or stem_name not in result.get("stems", {}):
+                raise HTTPException(404, "自定义音轨不存在。")
+            conflict = _mix_conflict(job)
+            if conflict is not None:
+                raise HTTPException(409, "工程正在处理音频，请稍后重试。")
+            require_audio_revision(result, request.headers.get("X-Audio-Revision"))
+            if not recording_position_editable(result, stem_name):
+                if not result.get("recordingClips", {}).get(stem_name, {}).get("source"):
+                    raise HTTPException(409, "旧版录音缺少原始片段，请重新导入后再调整位置。")
+                raise HTTPException(409, "录音已随创作固定，替换人声后可重新调整。")
+            return job, output, result
+
+        created = []
+        capacity = None
+        registered = False
+        try:
+            job, output, result = selected()
+            revision = result.get("audioRevision", 0)
+            source_url = result["stems"][stem_name]
+            published = _output_path_from_url(source_url, application_settings)
+            directory = published.parent
+            old_preview = (result.get("playback") or {}).get("stems", {}).get(stem_name)
+            obsolete = {published}
+            if old_preview:
+                obsolete.add(_output_path_from_url(old_preview, application_settings))
+            capacity = _orchestrator(request).capacity
+            try:
+                await capacity.acquire()
+            except CapacityExceededError:
+                capacity = None
+                raise HTTPException(429, "当前音频处理任务过多，请稍后重试。") from None
+            song_duration = await recording_song_duration(
+                _output_path_from_url(result["fullTrack"], application_settings)
+            )
+            source_clip = dict(result.get("recordingClips", {}).get(stem_name) or {})
+            if source_clip.get("source"):
+                source = _output_path_from_url(source_clip["source"], application_settings)
+            else:
+                # Migrate an uncommitted legacy lane once, retaining only its PCM clip.
+                source_directory = directory / "recording_sources"
+                source_directory.mkdir(exist_ok=True)
+                source = source_directory / f"{stem_name}_{uuid4().hex}.wav"
+                created.append(source)
+                source_clip = await asyncio.to_thread(
+                    move_recording_audio,
+                    published,
+                    source,
+                    0,
+                    source_clip,
+                    song_duration,
+                    application_settings.max_duration_minutes * 60,
+                    result.get("waveforms", {}).get(stem_name),
+                )
+                source_clip["source"] = source.relative_to(
+                    application_settings.output_dir
+                ).as_posix()
+            if not source_clip.get("waveform"):
+                source_clip["waveform"] = (await extract_waveforms({stem_name: source})).get(
+                    stem_name, []
+                )
+            with tempfile.TemporaryDirectory(prefix=".recording-", dir=directory) as staging:
+                prepared = Path(staging) / f"{stem_name}_{uuid4().hex}.wav"
+                clip = await asyncio.to_thread(
+                    move_recording_audio,
+                    source,
+                    prepared,
+                    body.position,
+                    source_clip,
+                    song_duration,
+                    application_settings.max_duration_minutes * 60,
+                    source_clip.get("waveform"),
+                )
+                waveforms = await extract_waveforms({stem_name: prepared})
+                preview = await make_playback_mp3(prepared, application_settings.output_dir)
+                if not preview:
+                    raise HTTPException(500, "试听音频生成失败，原位置已保留，请重试。")
+                current_job, _, current = selected()
+                if (
+                    current_job is not job
+                    or current is not result
+                    or current["stems"][stem_name] != source_url
+                    or current.get("audioRevision", 0) != revision
+                ):
+                    raise HTTPException(409, "歌曲版本已更新，请刷新后重试。")
+                target = directory / prepared.name
+                prepared.replace(target)
+                created.append(target)
+                preview_source = application_settings.output_dir / preview
+                preview_path = directory / "playtrack" / preview_source.name
+                preview_path.parent.mkdir(exist_ok=True)
+                preview_source.replace(preview_path)
+                created.append(preview_path)
+                previous = copy.deepcopy(result)
+                try:
+                    result["stems"][stem_name] = target.relative_to(
+                        application_settings.output_dir
+                    ).as_posix()
+                    result["stemUrls"] = list(result["stems"].values())
+                    result.setdefault("recordingClips", {})[stem_name] = clip
+                    result.setdefault("waveforms", {}).update(waveforms)
+                    _playback_dict(result).setdefault("stems", {})[stem_name] = (
+                        preview_path.relative_to(application_settings.output_dir).as_posix()
+                    )
+                    result["audioRevision"] = revision + 1
+                    job.save(application_settings.output_dir)
+                except BaseException:
+                    result.clear()
+                    result.update(previous)
+                    raise
+                registered = True
+            referenced = _referenced_output_paths(
+                [job.result, job.deleted_stems, job.deleted_replaced_vocals], application_settings
+            )
+            _unlink_paths(obsolete - referenced)
+            _publish_job(job, request, snapshot=True)
+            return await _async_job_response(job, request, application_settings)
+        except HTTPException as exc:
+            return JSONResponse(
+                status_code=exc.status_code, content={"success": False, "message": exc.detail}
+            )
+        except ReferenceInputError as exc:
+            return JSONResponse(status_code=400, content={"success": False, "message": str(exc)})
+        except (GenerationError, OSError, ValueError, wave.Error):
+            logger.exception("recording alignment failed job_id=%s", job_id)
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "message": "录音位置保存失败，原位置已保留。"},
+            )
+        finally:
+            if not registered:
+                for path in created:
+                    path.unlink(missing_ok=True)
+                for directory in {
+                    path.parent for path in created if path.parent.name == "recording_sources"
+                }:
+                    with suppress(OSError):
+                        directory.rmdir()
             if capacity is not None:
                 await capacity.release()
 
@@ -2805,6 +2986,8 @@ def create_app(
         }
         if stem_name in result.get("stemNames", {}):
             deleted_entry["name"] = result["stemNames"].pop(stem_name)
+        if stem_name in result.get("recordingClips", {}):
+            deleted_entry["clip"] = result["recordingClips"].pop(stem_name)
         playback = result.get("playback")
         stem_playback = playback.get("stems") if isinstance(playback, dict) else None
         if isinstance(stem_playback, dict):
@@ -2915,6 +3098,8 @@ def create_app(
         result["stems"] = dict(items)
         if isinstance(deleted.get("name"), str):
             result.setdefault("stemNames", {})[stem_name] = deleted["name"]
+        if isinstance(deleted.get("clip"), dict):
+            result.setdefault("recordingClips", {})[stem_name] = deleted["clip"]
         if isinstance(deleted.get("playback"), str):
             _playback_dict(result).setdefault("stems", {})[stem_name] = deleted["playback"]
         result["stemUrls"] = list(result["stems"].values())
@@ -3442,6 +3627,7 @@ def _render_result_urls(
         if not isinstance(output, dict):
             continue
         output.setdefault("audioRevision", 0)
+        output["committedRecordingIds"] = committed_recording_ids(output)
         drop_editor_state(output)
         full_track = output.get("fullTrack")
         if isinstance(full_track, str):
@@ -3518,6 +3704,11 @@ def _without_waveforms(result: dict[str, Any]) -> dict[str, Any]:
     """
     projected = {key: value for key, value in result.items() if key != "waveforms"}
     projected["waveforms"] = {}
+    if isinstance(result.get("recordingClips"), dict):
+        projected["recordingClips"] = {
+            stem: {key: value for key, value in clip.items() if key != "waveform"}
+            for stem, clip in result["recordingClips"].items()
+        }
     if isinstance(result.get("mixed"), dict):
         projected["mixed"] = _without_waveforms(result["mixed"])
     alternatives = result.get("alternatives")

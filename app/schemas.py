@@ -90,6 +90,20 @@ class ErrorResponse(BaseModel):
     message: str
 
 
+class RecordingClip(BaseModel):
+    source: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    # Read model: a malformed stored clip must not fail the whole job response.
+    position: float
+    duration: float
+    waveform: list[float] | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class RecordingPositionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    # Bounded so seconds * sample rate always fits an int; the song limit is checked later.
+    position: float = Field(ge=0, le=24 * 60 * 60, allow_inf_nan=False)
+
+
 class RecordingUploadResponse(BaseModel):
     id: str
     name: str
@@ -120,6 +134,12 @@ class MusicOutput(BaseModel):
     durationSeconds: float | None = None
     stems: dict[str, str]
     stemNames: dict[str, str] | None = Field(default=None, exclude_if=lambda value: value is None)
+    committedRecordingIds: list[str] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+    recordingClips: dict[str, RecordingClip] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     stemUrls: list[str]
     waveforms: dict[str, list[float]]
     splitEnabled: bool
