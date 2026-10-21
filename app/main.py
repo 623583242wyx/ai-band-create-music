@@ -3272,6 +3272,11 @@ def _audio_io_error(exc: OSError, path: Path) -> HTTPException:
 def _generation_parameters(
     payload: GenerateRequest, settings: Settings
 ) -> tuple[str, int | float | None]:
+    provider = payload.provider or settings.music_provider
+    if payload.directPrompt and provider == "minimax_music":
+        raise ValueError(
+            "MiniMax 功能暂时停止维护，收起页直传请选择 Mureka 或 ElevenLabs。"
+        )
     prompt = payload.prompt if payload.directPrompt else payload.prompt.strip()
     if not prompt.strip():
         raise ValueError("prompt 不能为空，请输入歌曲风格描述。")

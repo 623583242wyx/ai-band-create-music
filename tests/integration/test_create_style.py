@@ -68,7 +68,7 @@ async def test_style_expansion_endpoint_validates_and_does_not_create_job(tmp_pa
     orchestrator.prompt_expander.expand_style.assert_awaited_once_with("雨夜民谣")
 
 
-@pytest.mark.parametrize("provider", ["mureka_music", "minimax_music", "elevenlabs_music"])
+@pytest.mark.parametrize("provider", ["mureka_music", "elevenlabs_music"])
 @pytest.mark.parametrize("prompt", ["  雨夜民谣  ", CHINESE_STYLE])
 async def test_direct_style_skips_expansion_and_llm_calls(
     tmp_path: Path, provider: str, prompt: str
@@ -115,37 +115,59 @@ async def test_fullwidth_chinese_colons_do_not_trigger_retry(tmp_path: Path):
     assert len(calls) == 1
 
 
-async def test_minimax_raw_input_reaches_provider_without_wrapping(tmp_path: Path):
-    from app.core.errors import GenerationError
-    from app.services.providers import MiniMaxMusicProvider
-
-    supplied = []
-
-    def handler(request):
-        supplied.append(json.loads(request.content))
-        return httpx.Response(500, json={"message": "stop after capturing request"})
-
-    settings = make_settings(tmp_path, minimax_base_url="http://minimax.test")
-    raw = "  雨夜民谣，木吉他  "
-    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        with pytest.raises(GenerationError):
-            await MiniMaxMusicProvider(settings, client).generate(raw, None, raw)
-    assert len(supplied) == 1
-    assert supplied[0]["input"] == raw
-    assert supplied[0]["instructions"] == raw
+@pytest.mark.parametrize("payload", [{"provider": "minimax_music"}, {}])
+async def test_direct_minimax_is_temporarily_unavailable(
+    tmp_path: Path, payload: dict[str, str]
+):
+    settings = make_settings(tmp_path)
+    app = create_app(settings, make_orchestrator(settings))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/generate", json={**payload, "prompt": "雨夜民谣", "directPrompt": True}
+        )
+    assert response.status_code == 400
+    assert "暂时停止维护" in response.json()["message"]
 
 
-async def test_mureka_rejects_long_raw_style_instead_of_silently_truncating(tmp_path: Path):
-    from app.core.errors import GenerationError
+async def test_mureka_truncates_long_raw_style_and_reports_it(tmp_path: Path):
     from app.services.providers import MurekaMusicProvider
 
-    def handler(request):
-        pytest.fail("oversized raw style must not reach provider")
+    requests = []
 
+    def handler(request):
+        requests.append(request)
+        path = request.url.path
+        if path == "/v1/lyrics/generate":
+            return httpx.Response(200, json={"title": "雨夜", "lyrics": "[Verse]\n第一句"})
+        if path == "/v1/song/generate":
+            return httpx.Response(200, json={"id": "task-1", "status": "preparing"})
+        if path == "/v1/song/query/task-1":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "task-1",
+                    "status": "succeeded",
+                    "choices": [
+                        {"id": "song-1", "url": "https://cdn.test/a.mp3", "duration": 1000}
+                    ],
+                },
+            )
+        return httpx.Response(200, content=b"mp3-bytes")
+
+    settings = make_settings(
+        tmp_path, mureka_api_key="test", music_poll_interval_seconds=0
+    )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-        instance = MurekaMusicProvider(make_settings(tmp_path, mureka_api_key="test"), client)
-        with pytest.raises(GenerationError, match="1024"):
-            await instance.generate("风" * 1025, None, "风" * 1025)
+        result = await MurekaMusicProvider(settings, client).generate(
+            "风" * 1025, None, "风" * 1025
+        )
+
+    song_request = next(r for r in requests if r.url.path == "/v1/song/generate")
+    assert len(json.loads(song_request.content)["prompt"]) == 1024
+    assert result.debug["styleTruncated"] is True
+    assert result.lyrics == "[Verse]\n第一句"
 
 async def test_direct_provider_metadata_is_saved_to_job_json(tmp_path: Path):
     settings = make_settings(tmp_path)
@@ -187,3 +209,27 @@ def test_chinese_style_rejects_no_vocal_human_tag():
     )
     with pytest.raises(ValueError, match="人声标签"):
         validate_chinese_style(no_vocal)
+
+async def test_mureka_style_truncation_is_returned_as_warning(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+
+    async def truncated(style, duration, raw_prompt, **kwargs):
+        return MusicResult(
+            settings.mock_full_song_path,
+            {"provider": "mureka_music", "styleTruncated": True},
+            title="雨夜",
+            lyrics="[Verse]\n第一句",
+        )
+
+    orchestrator.music_provider.generate = truncated
+    app = create_app(settings, orchestrator)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/generate",
+            json={"prompt": "风" * 1025, "provider": "mureka_music", "directPrompt": True},
+        )
+    assert response.status_code == 200, response.text
+    assert "1024" in response.json()["warning"]

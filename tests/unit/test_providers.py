@@ -209,7 +209,7 @@ async def test_elevenlabs_direct_prompt_reads_detailed_metadata(tmp_path: Path) 
         requests.append(request)
         return httpx.Response(
             200,
-            content=body,
+            stream=ChunkedBody(body[:37], body[37:51], body[51:200], body[200:]),
             headers={"content-type": f"multipart/mixed; boundary={boundary}"},
         )
 

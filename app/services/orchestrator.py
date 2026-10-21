@@ -364,6 +364,11 @@ class GenerationOrchestrator:
                         lyrics = music_result.lyrics
                     response["title"] = song_title
                     response["lyrics"] = lyrics
+                    if music_result.debug.get("styleTruncated"):
+                        note = "Mureka 风格说明超过 1024 字符，已截断"
+                        response["warning"] = "；".join(
+                            filter(None, [response.get("warning"), note])
+                        )
                     if music_result.title or music_result.lyrics:
                         # job.json 与 prompts.json 都留下服务商返回的歌名/歌词。
                         update_job_diagnostics(
@@ -423,7 +428,9 @@ class GenerationOrchestrator:
                     **outputs[0],
                     "count": len(outputs),
                     "alternatives": outputs[1:],
-                    "warning": "；".join(failures) or None,
+                    "warning": "；".join(
+                        filter(None, [response.get("warning"), *failures])
+                    ) or None,
                 }
                 await report(
                     "song_completed", task_progress, f"第 {song_number} 首已生成，可播放和下载"

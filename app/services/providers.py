@@ -165,8 +165,11 @@ def _has_lyric_text(text: str) -> bool:
     return bool(re.sub(r"\[[^\]]+\]|\{[^}]+\}", "", text).strip())
 
 
-def _parse_detailed_music(content: bytes, content_type: str) -> tuple[dict[str, Any], bytes]:
-    """拆分 ElevenLabs /v1/music/detailed 的 multipart：JSON 元数据 + 二进制音频。"""
+async def _detailed_music_audio(
+    response: httpx.Response, metadata: dict[str, Any]
+) -> AsyncIterator[bytes]:
+    """增量解析 ElevenLabs detailed 的 multipart，音频边收边写，不整包缓冲。"""
+    content_type = response.headers.get("content-type", "")
     marker = "boundary="
     boundary = (
         content_type.split(marker, 1)[1].split(";", 1)[0].strip().strip('"')
@@ -174,27 +177,58 @@ def _parse_detailed_music(content: bytes, content_type: str) -> tuple[dict[str, 
         else ""
     )
     if not boundary:
-        return {}, b""
+        raise GenerationError("ElevenLabs 音乐生成失败：详细响应缺少 multipart boundary。")
     delimiter = f"--{boundary}".encode()
-    metadata: dict[str, Any] = {}
-    audio = b""
-    for part in content.split(delimiter)[1:]:
-        header, separator, body = part.partition(b"\r\n\r\n")
-        if not separator:
-            header, separator, body = part.partition(b"\n\n")
-        if not separator:
+    buffer = b""
+    state = "json_headers"
+    async for chunk in response.aiter_bytes():
+        if not chunk:
             continue
-        body = body.removesuffix(b"\r\n").removesuffix(b"\n").removeprefix(b"\r\n")
-        if b"json" in header.lower():
-            try:
-                parsed = json.loads(body.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError):
-                continue
-            if isinstance(parsed, dict):
-                metadata = parsed
-        elif len(body) > len(audio):
-            audio = body
-    return metadata, audio
+        buffer += chunk
+        while True:
+            if state == "json_headers":
+                index = buffer.find(b"\r\n\r\n")
+                if index < 0:
+                    break
+                buffer = buffer[index + 4 :]
+                state = "json_body"
+            elif state == "json_body":
+                index = buffer.find(b"\r\n" + delimiter)
+                if index < 0:
+                    break
+                body = buffer[:index]
+                buffer = buffer[index + 2 + len(delimiter) :]
+                try:
+                    parsed = json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, ValueError) as exc:
+                    raise GenerationError(
+                        "ElevenLabs 音乐生成失败：详细响应元数据无效。"
+                    ) from exc
+                if not isinstance(parsed, dict):
+                    raise GenerationError(
+                        "ElevenLabs 音乐生成失败：详细响应元数据不是 JSON 对象。"
+                    )
+                metadata.update(parsed)
+                state = "audio_headers"
+            elif state == "audio_headers":
+                index = buffer.find(b"\r\n\r\n")
+                if index < 0:
+                    break
+                buffer = buffer[index + 4 :]
+                state = "audio"
+            else:
+                # 留出结尾 boundary 的长度，避免把分隔符写进音频。
+                hold = len(delimiter) + 8
+                if len(buffer) > hold:
+                    yield buffer[:-hold]
+                    buffer = buffer[-hold:]
+                break
+    if state != "audio":
+        raise GenerationError("ElevenLabs 音乐生成失败：详细响应结构无效。")
+    index = buffer.rfind(b"\r\n" + delimiter)
+    audio = buffer[:index] if index >= 0 else buffer
+    if audio:
+        yield audio
 
 
 def _detailed_music_text(metadata: dict[str, Any]) -> tuple[str | None, str | None]:
@@ -210,8 +244,6 @@ def _detailed_music_text(metadata: dict[str, Any]) -> tuple[str | None, str | No
     )
 
 
-async def _bytes_as_chunks(data: bytes) -> AsyncIterator[bytes]:
-    yield data
 
 
 def _audio_target(
@@ -748,26 +780,25 @@ class ElevenLabsMusicProvider:
             for attempt in range(2):
                 if direct_prompt:
                     # detailed 是唯一同时返回音频与 song_metadata/歌词的接口。
-                    response = await self._client.post(
+                    async with self._client.stream(
+                        "POST",
                         url,
                         json=request_body,
                         params={"output_format": output_format},
                         headers=self._headers(),
                         timeout=self._settings.music_api_timeout_seconds,
-                    )
-                    response.raise_for_status()
-                    metadata, audio = _parse_detailed_music(
-                        response.content, response.headers.get("content-type", "")
-                    )
-                    if not audio:
-                        raise GenerationError("ElevenLabs 音乐生成失败：详细响应缺少音频。")
-                    actual_duration_seconds = await self._write_pcm_wav(
-                        _bytes_as_chunks(audio),
-                        target,
-                        sample_rate,
-                        expected_seconds,
-                        progress=progress,
-                    )
+                    ) as response:
+                        if not response.is_success:
+                            await response.aread()
+                        response.raise_for_status()
+                        metadata: dict[str, Any] = {}
+                        actual_duration_seconds = await self._write_pcm_wav(
+                            _detailed_music_audio(response, metadata),
+                            target,
+                            sample_rate,
+                            expected_seconds,
+                            progress=progress,
+                        )
                     title, generated_lyrics = _detailed_music_text(metadata)
                     break
                 async with self._client.stream(
@@ -1400,10 +1431,6 @@ class MurekaMusicProvider:
         lyrics, _ = split_generation_prompt(user_prompt)
         song_title = None
         if not lyrics:
-            if len(structured_prompt) > MUREKA_PROMPT_MAX_CHARS:
-                raise GenerationError(
-                    f"Mureka 风格说明不能超过 {MUREKA_PROMPT_MAX_CHARS} 个字符，请缩短后重试。"
-                )
             song_title, lyrics = await self._generate_lyrics(structured_prompt)
         if len(lyrics) > MUREKA_LYRICS_MAX_CHARS:
             raise GenerationError(
@@ -1515,6 +1542,7 @@ class MurekaMusicProvider:
                     "mode": "polling",
                     "taskId": task_id,
                     "songId": choice.get("id"),
+                    "styleTruncated": len(structured_prompt) > MUREKA_PROMPT_MAX_CHARS,
                     **(
                         {"durationSeconds": duration_ms / 1000}
                         if isinstance(duration_ms, (int, float))

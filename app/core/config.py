@@ -196,12 +196,23 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def fill_style_llm_defaults(self) -> Settings:
-        if not self.style_llm_base_url:
+        # 只有完全没有独立 style 端点时才继承主 LLM 的地址和 Key。
+        independent_endpoint = bool(
+            self.style_llm_base_url or self.style_llm_chat_completions_url
+        )
+        if not independent_endpoint:
+            self.style_llm_base_url = self.llm_base_url
+            self.style_llm_chat_completions_url = self.llm_chat_completions_url
+            # 空字符串也视为未配置；回退到主 LLM 时必须带上主 LLM 的 Key。
+            if not (
+                self.style_llm_api_key
+                and self.style_llm_api_key.get_secret_value().strip()
+            ):
+                self.style_llm_api_key = self.llm_api_key
+        elif not self.style_llm_base_url:
             self.style_llm_base_url = self.llm_base_url
         if not self.style_llm_model:
             self.style_llm_model = self.llm_model
-        if self.style_llm_api_key is None:
-            self.style_llm_api_key = self.llm_api_key
         if self.style_llm_timeout_seconds is None:
             self.style_llm_timeout_seconds = self.llm_timeout_seconds
         if self.style_llm_temperature is None:

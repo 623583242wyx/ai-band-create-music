@@ -140,6 +140,8 @@ class PromptExpander(Protocol):
         title: str | None = None,
     ) -> PreparedPrompt: ...
 
+    async def expand_style(self, prompt: str) -> str: ...
+
 
 def split_generation_prompt(user_prompt: str) -> tuple[str, str]:
     """Split the exact section format sent by the Create page."""

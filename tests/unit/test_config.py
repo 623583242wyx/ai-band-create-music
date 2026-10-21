@@ -119,6 +119,29 @@ def test_style_llm_falls_back_to_main_llm(tmp_path: Path) -> None:
     assert settings.style_llm_api_key == settings.llm_api_key
 
 
+def test_style_llm_blank_key_falls_back_only_without_independent_endpoint(
+    tmp_path: Path,
+) -> None:
+    fallback = make_settings(tmp_path, llm_api_key="main-key", style_llm_api_key="")
+    assert fallback.style_llm_api_key.get_secret_value() == "main-key"
+
+    independent = make_settings(
+        tmp_path,
+        llm_api_key="main-key",
+        style_llm_api_key="",
+        style_llm_base_url="http://style.test/v1",
+    )
+    assert independent.style_llm_api_key.get_secret_value() == ""
+
+
+def test_style_llm_url_inherits_main_chat_completions_url(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        llm_chat_completions_url="https://main.test/v1/chat/completions",
+    )
+    assert settings.style_llm_url == settings.llm_url
+
+
 def test_style_llm_base_url_ignores_main_chat_completions_url(tmp_path: Path) -> None:
     settings = make_settings(
         tmp_path,
