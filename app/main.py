@@ -690,7 +690,7 @@ def create_app(
             secret = application_settings.mureka_api_key
             checks["provider"] = bool(secret and secret.get_secret_value())
         elif application_settings.music_provider == "elevenlabs_music":
-            secret = application_settings.elevenlabs_api_key
+            secret = application_settings.elevenlabs_api_key or application_settings.music_api_key
             checks["provider"] = bool(secret and secret.get_secret_value())
         else:
             checks["provider"] = bool(application_settings.music_api_base_url)

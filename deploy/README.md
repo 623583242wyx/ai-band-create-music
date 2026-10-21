@@ -46,9 +46,12 @@ curl --fail http://127.0.0.1:${APP_PORT:-8010}/version
 `SOURCE_REVISION` 由构建参数传入，镜像标签默认 `latest`；发布时使用唯一标签并记录镜像 ID：
 
 ```bash
-SOURCE_REVISION="$(git rev-parse HEAD)" IMAGE_TAG="$(git rev-parse --short HEAD)" \
-  docker compose -f deploy/compose.yaml build
+export SOURCE_REVISION="$(git rev-parse HEAD)"
+export IMAGE_TAG="$(git rev-parse --short HEAD)"
+docker compose -f deploy/compose.yaml build
 docker compose -f deploy/compose.yaml up -d --no-build --wait --wait-timeout 120
 ```
+
+构建和启动必须在同一个 shell 中执行，或通过 `--env-file` 明确传入同一份发布变量。`up` 不继承上一条命令的临时环境，否则会退回到 `.env` 或默认的 `latest` 镜像。
 
 服务更新会重启单个进程；正在运行的生成任务可能中断。需要保留旧输出时先停止服务，按数据备份流程处理后再切换。

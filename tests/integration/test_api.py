@@ -142,6 +142,19 @@ async def test_generate_preserves_not_ready_response(tmp_path: Path) -> None:
     assert response.json()["detail"] == "Application is not ready"
 
 
+async def test_ready_accepts_music_api_key_for_elevenlabs(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        music_provider="elevenlabs_music",
+        music_api_key="generic-key",
+    )
+    app = create_app(settings)
+    async with await _client(app) as client:
+        response = await client.get("/api/health/ready")
+    assert response.status_code == 200
+    assert response.json()["checks"]["provider"] is True
+
+
 async def test_generate_returns_full_track_without_splitting(tmp_path: Path) -> None:
     settings = make_settings(
         tmp_path,
