@@ -31,7 +31,13 @@ async def test_style_expansion_only_returns_chinese_style_and_retries(tmp_path: 
         )
 
     settings = make_settings(
-        tmp_path, llm_api_key=None, llm_temperature=0.7, llm_model="Qwen/Qwen3.5-9B-FP8"
+        tmp_path,
+        llm_api_key=None,
+        llm_temperature=0.7,
+        llm_model="Qwen/Qwen3.5-9B-FP8",
+        style_llm_base_url="https://style.test/v1",
+        style_llm_model="Qwen/Qwen3.5-9B-FP8",
+        style_llm_temperature=0.7,
     )
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         expanded = await OpenAICompatiblePromptExpander(settings, client).expand_style("雨夜民谣")
@@ -235,3 +241,65 @@ async def test_mureka_style_truncation_is_returned_as_warning(tmp_path: Path):
         )
     assert response.status_code == 200, response.text
     assert "1024" in response.json()["warning"]
+
+async def test_style_expansion_falls_back_to_doubao_conventions(tmp_path: Path):
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps({"styleTags": RAW_CHINESE_STYLE})}}
+                ]
+            },
+        )
+
+    settings = make_settings(
+        tmp_path, llm_model="doubao-test", llm_base_url="https://main.test/v1"
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await OpenAICompatiblePromptExpander(settings, client).expand_style("雨夜民谣")
+
+    assert calls[0]["response_format"] == {"type": "json_object"}
+    assert calls[0]["thinking"] == {"type": "disabled"}
+    assert "chat_template_kwargs" not in calls[0]
+
+async def test_mureka_truncation_warning_survives_second_song_failure(
+    tmp_path: Path,
+):
+    from app.core.errors import GenerationError
+
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+
+    async def mixed(style, duration, raw_prompt, *, variation=0, **kwargs):
+        if variation == 0:
+            return MusicResult(
+                settings.mock_full_song_path,
+                {"provider": "mureka_music", "styleTruncated": True},
+                title="雨夜",
+                lyrics="[Verse]\n第一句",
+            )
+        raise GenerationError("第二首失败")
+
+    orchestrator.music_provider.generate = mixed
+    app = create_app(settings, orchestrator)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/generate",
+            json={
+                "prompt": "风" * 1025,
+                "provider": "mureka_music",
+                "directPrompt": True,
+                "count": 2,
+            },
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "1024" in body["warning"]
+    assert "第二首失败" in body["warning"]
+    assert body["count"] == 1

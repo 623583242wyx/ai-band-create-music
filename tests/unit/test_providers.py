@@ -1075,7 +1075,7 @@ async def test_elevenlabs_detailed_multipart_handles_preamble_and_extra_parts(
     extra = {"words_timestamps": [{"word": "雨", "start_ms": 0}]}
     body = (
         b"preamble before the first boundary\r\n"
-        + f"--{boundary}\r\nContent-Type: audio/pcm\r\n\r\n".encode()
+        + f"--{boundary}\r\nContent-Type: binary/octet-stream\r\n\r\n".encode()
         + pcm
         + b"\r\n"
         + f"--{boundary}\r\nContent-Type: application/json\r\n\r\n".encode()
@@ -1084,6 +1084,8 @@ async def test_elevenlabs_detailed_multipart_handles_preamble_and_extra_parts(
         + f"--{boundary}\r\nContent-Type: application/json\r\n\r\n".encode()
         + json.dumps(extra, ensure_ascii=False).encode()
         + b"\r\n"
+        + f"--{boundary}\r\nContent-Type: application/json\r\n\r\n".encode()
+        + b'[{"word": "ignored"}]\r\n'
         + f"--{boundary}\r\nContent-Type: text/plain\r\n\r\n".encode()
         + b"ignored extra part\r\n"
         + f"--{boundary}--\r\n".encode()

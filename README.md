@@ -35,7 +35,8 @@ Blackwell `sm_120`；BS-RoFormer 和 RVC 共用这一套 CUDA 环境，不再安
 运行拆轨或默认的 RVC 配置需要可用的 NVIDIA 驱动和 CUDA GPU。
 
 编辑 `.env`，至少配置 LLM Key。`LLM_*` 用于展开页和 AI-talk；
-Create 收起页的中文风格扩写使用独立的 `STYLE_LLM_*`，整段未配置时回退到 `LLM_*`。
+Create 收起页的中文风格扩写使用独立的 `STYLE_LLM_*`，整段未配置时回退到 `LLM_*`；
+回退时沿用主 LLM 的 JSON/thinking 约定（Doubao/OpenAI 使用 `json_object`）。
 例如本地 Qwen（按实际地址调整，空 Key 表示端点不需要鉴权）：
 
 ```env

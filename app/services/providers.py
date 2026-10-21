@@ -212,10 +212,11 @@ async def _detailed_music_audio(
                 buffer = buffer[index + 4 :]
                 if b"application/json" in header:
                     state = "json"
-                elif b"audio/" in header or b"application/octet-stream" in header:
-                    state = "audio"
-                else:
+                elif b"text/" in header or b"image/" in header:
                     state = "skip"
+                else:
+                    # 未识别的二进制段按音频处理，兼容 binary/octet-stream 等类型。
+                    state = "audio"
             elif state == "json":
                 index = buffer.find(separator)
                 if index < 0:
@@ -228,11 +229,9 @@ async def _detailed_music_audio(
                     raise GenerationError(
                         "ElevenLabs 音乐生成失败：详细响应元数据无效。"
                     ) from exc
-                if not isinstance(parsed, dict):
-                    raise GenerationError(
-                        "ElevenLabs 音乐生成失败：详细响应元数据不是 JSON 对象。"
-                    )
-                metadata.update(parsed)
+                if isinstance(parsed, dict):
+                    metadata.update(parsed)
+                # 数组等非对象 JSON 段（例如时间戳）跳过，不影响音频。
                 state = "after_boundary"
             elif state == "audio":
                 index = buffer.find(separator)

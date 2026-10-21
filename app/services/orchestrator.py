@@ -417,7 +417,12 @@ class GenerationOrchestrator:
                     if task_progress is not None:
                         task_progress = min(99, int(song_number / effective_count * 100))
                     if latest_result is not None:
-                        latest_result = {**latest_result, "warning": "；".join(failures)}
+                        latest_result = {
+                            **latest_result,
+                            "warning": "；".join(
+                                filter(None, [response.get("warning"), *failures])
+                            ) or None,
+                        }
                     await report("song_failed", task_progress, failures[-1])
                     if isinstance(exc, ProviderGlobalError) or effective_count == 1:
                         raise

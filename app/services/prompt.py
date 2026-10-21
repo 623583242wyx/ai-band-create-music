@@ -459,19 +459,29 @@ class OpenAICompatiblePromptExpander:
         timeout_seconds = settings.style_llm_timeout_seconds or settings.llm_timeout_seconds
         api_key = settings.style_llm_api_key
         max_attempts = settings.style_llm_max_attempts
-        response_format = (
-            {
-                "type": "json_schema",
-                "json_schema": {"name": "music_style", "strict": True, "schema": schema},
-            }
-            if settings.style_llm_response_format == "json_schema"
-            else {"type": "json_object"}
-        )
-        body_extra: dict[str, Any] = {}
-        if "qwen3" in model.lower() or settings.style_llm_enable_thinking:
-            body_extra["chat_template_kwargs"] = {
-                "enable_thinking": settings.style_llm_enable_thinking
-            }
+        if settings.style_llm_inherits_main:
+            # 回退到主 LLM 时沿用主 LLM 的 provider 约定，避免 Doubao 收到 json_schema。
+            response_format: dict[str, Any] = {"type": "json_object"}
+            body_extra: dict[str, Any] = {}
+            if settings.llm_disable_thinking:
+                if "qwen3" in model.lower():
+                    body_extra["chat_template_kwargs"] = {"enable_thinking": False}
+                elif "doubao" in model.lower():
+                    body_extra["thinking"] = {"type": "disabled"}
+        else:
+            response_format = (
+                {
+                    "type": "json_schema",
+                    "json_schema": {"name": "music_style", "strict": True, "schema": schema},
+                }
+                if settings.style_llm_response_format == "json_schema"
+                else {"type": "json_object"}
+            )
+            body_extra = {}
+            if "qwen3" in model.lower() or settings.style_llm_enable_thinking:
+                body_extra["chat_template_kwargs"] = {
+                    "enable_thinking": settings.style_llm_enable_thinking
+                }
         body: dict[str, Any] = {
             "model": model,
             "temperature": temperature,

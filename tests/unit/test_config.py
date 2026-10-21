@@ -117,6 +117,7 @@ def test_style_llm_falls_back_to_main_llm(tmp_path: Path) -> None:
     assert settings.style_llm_temperature == 0.3
     assert settings.style_llm_base_url == settings.llm_base_url
     assert settings.style_llm_api_key == settings.llm_api_key
+    assert settings.style_llm_inherits_main is True
 
 
 def test_style_llm_blank_key_falls_back_only_without_independent_endpoint(
@@ -164,3 +165,4 @@ def test_style_llm_overrides_main_llm_independently(tmp_path: Path) -> None:
     assert settings.style_llm_model == "qwen-test"
     assert settings.style_llm_temperature == 0.7
     assert settings.style_llm_url == "http://style.test/v1/chat/completions"
+    assert settings.style_llm_inherits_main is False

@@ -242,6 +242,10 @@ class Settings(BaseSettings):
         return self.style_llm_chat_completions_url or f"{self.style_llm_base_url}/chat/completions"
 
     @property
+    def style_llm_inherits_main(self) -> bool:
+        return self.style_llm_url == self.llm_url
+
+    @property
     def cors_origin_list(self) -> list[str]:
         if self.cors_origins.strip() == "*":
             return ["*"]
