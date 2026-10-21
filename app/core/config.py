@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
+from pydantic import AliasChoices, Field, PrivateAttr, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     style_llm_enable_thinking: bool = False
     style_llm_trust_env_proxy: bool = True
     style_llm_max_attempts: int = Field(default=2, ge=1, le=5)
+    # 显式配置 style base/chat URL 即视为独立端点，即使地址与主 LLM 相同。
+    _style_llm_independent: bool = PrivateAttr(default=False)
 
     music_api_mode: Literal["mock", "real"] = "mock"
     music_provider: Literal[
@@ -200,6 +202,7 @@ class Settings(BaseSettings):
         independent_endpoint = bool(
             self.style_llm_base_url or self.style_llm_chat_completions_url
         )
+        self._style_llm_independent = independent_endpoint
         if not independent_endpoint:
             self.style_llm_base_url = self.llm_base_url
             self.style_llm_chat_completions_url = self.llm_chat_completions_url
@@ -243,7 +246,7 @@ class Settings(BaseSettings):
 
     @property
     def style_llm_inherits_main(self) -> bool:
-        return self.style_llm_url == self.llm_url
+        return not self._style_llm_independent
 
     @property
     def cors_origin_list(self) -> list[str]:

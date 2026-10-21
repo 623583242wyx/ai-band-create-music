@@ -459,15 +459,19 @@ class OpenAICompatiblePromptExpander:
         timeout_seconds = settings.style_llm_timeout_seconds or settings.llm_timeout_seconds
         api_key = settings.style_llm_api_key
         max_attempts = settings.style_llm_max_attempts
+        response_format: dict[str, Any] | None = None
+        body_extra: dict[str, Any] = {}
         if settings.style_llm_inherits_main:
-            # 回退到主 LLM 时沿用主 LLM 的 provider 约定，避免 Doubao 收到 json_schema。
-            response_format: dict[str, Any] = {"type": "json_object"}
-            body_extra: dict[str, Any] = {}
+            # 与主 prepare 的条件保持一致：只有 Doubao/OpenAI 才发 json_object。
             if settings.llm_disable_thinking:
                 if "qwen3" in model.lower():
                     body_extra["chat_template_kwargs"] = {"enable_thinking": False}
                 elif "doubao" in model.lower():
                     body_extra["thinking"] = {"type": "disabled"}
+            if "doubao" in model.lower() or settings.llm_url.startswith(
+                "https://api.openai.com/"
+            ):
+                response_format = {"type": "json_object"}
         else:
             response_format = (
                 {
@@ -477,7 +481,6 @@ class OpenAICompatiblePromptExpander:
                 if settings.style_llm_response_format == "json_schema"
                 else {"type": "json_object"}
             )
-            body_extra = {}
             if "qwen3" in model.lower() or settings.style_llm_enable_thinking:
                 body_extra["chat_template_kwargs"] = {
                     "enable_thinking": settings.style_llm_enable_thinking
@@ -487,9 +490,10 @@ class OpenAICompatiblePromptExpander:
             "temperature": temperature,
             "max_tokens": max_tokens,
             "messages": messages,
-            "response_format": response_format,
             **body_extra,
         }
+        if response_format is not None:
+            body["response_format"] = response_format
         headers = self._auth_headers(api_key)
         reason = ""
         for attempt in range(max_attempts):

@@ -303,3 +303,54 @@ async def test_mureka_truncation_warning_survives_second_song_failure(
     assert "1024" in body["warning"]
     assert "第二首失败" in body["warning"]
     assert body["count"] == 1
+
+async def test_style_expansion_custom_main_omits_response_format(tmp_path: Path):
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps({"styleTags": RAW_CHINESE_STYLE})}}
+                ]
+            },
+        )
+
+    settings = make_settings(
+        tmp_path, llm_model="custom-test", llm_base_url="https://custom.test/v1"
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await OpenAICompatiblePromptExpander(settings, client).expand_style("雨夜民谣")
+
+    assert "response_format" not in calls[0]
+
+
+async def test_style_expansion_explicit_same_url_keeps_json_schema(tmp_path: Path):
+    calls = []
+
+    def handler(request):
+        calls.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {"message": {"content": json.dumps({"styleTags": RAW_CHINESE_STYLE})}}
+                ]
+            },
+        )
+
+    settings = make_settings(
+        tmp_path,
+        llm_model="custom-test",
+        llm_base_url="https://custom.test/v1",
+        style_llm_base_url="https://custom.test/v1",
+        style_llm_model="custom-test",
+        style_llm_response_format="json_schema",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        await OpenAICompatiblePromptExpander(settings, client).expand_style("雨夜民谣")
+
+    assert settings.style_llm_inherits_main is False
+    assert calls[0]["response_format"]["type"] == "json_schema"

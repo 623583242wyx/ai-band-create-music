@@ -182,6 +182,8 @@ async def _detailed_music_audio(
     separator = b"\r\n" + delimiter
     buffer = b""
     state = "preamble"
+    json_parts = 0
+    object_parts = 0
     async for chunk in response.aiter_bytes():
         if not chunk:
             continue
@@ -198,6 +200,10 @@ async def _detailed_music_audio(
                 if len(buffer) < 2:
                     break
                 if buffer.startswith(b"--"):
+                    if json_parts and not object_parts:
+                        logger.warning(
+                            "ElevenLabs detailed response had JSON parts but no metadata object"
+                        )
                     return
                 index = buffer.find(b"\r\n")
                 if index < 0:
@@ -211,6 +217,7 @@ async def _detailed_music_audio(
                 header = buffer[:index].lower()
                 buffer = buffer[index + 4 :]
                 if b"application/json" in header:
+                    json_parts += 1
                     state = "json"
                 elif b"text/" in header or b"image/" in header:
                     state = "skip"
@@ -230,6 +237,7 @@ async def _detailed_music_audio(
                         "ElevenLabs 音乐生成失败：详细响应元数据无效。"
                     ) from exc
                 if isinstance(parsed, dict):
+                    object_parts += 1
                     metadata.update(parsed)
                 # 数组等非对象 JSON 段（例如时间戳）跳过，不影响音频。
                 state = "after_boundary"

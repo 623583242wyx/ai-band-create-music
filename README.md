@@ -36,7 +36,9 @@ Blackwell `sm_120`；BS-RoFormer 和 RVC 共用这一套 CUDA 环境，不再安
 
 编辑 `.env`，至少配置 LLM Key。`LLM_*` 用于展开页和 AI-talk；
 Create 收起页的中文风格扩写使用独立的 `STYLE_LLM_*`，整段未配置时回退到 `LLM_*`；
-回退时沿用主 LLM 的 JSON/thinking 约定（Doubao/OpenAI 使用 `json_object`）。
+回退时沿用主 LLM 的 JSON/thinking 约定（Doubao/OpenAI 使用 `json_object`，其它主端点不发
+`response_format`）。显式配置 `STYLE_LLM_BASE_URL` 即视为独立端点，即使与主 LLM 同地址也不会
+继承主 Key；需要鉴权时设置 `STYLE_LLM_API_KEY`。
 例如本地 Qwen（按实际地址调整，空 Key 表示端点不需要鉴权）：
 
 ```env
