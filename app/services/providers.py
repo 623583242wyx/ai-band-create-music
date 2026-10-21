@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import time
@@ -109,6 +110,7 @@ def build_elevenlabs_prompt(
     duration_minutes: float | None,
     clear_chinese_vocal_mode: bool,
     lyrics: str = "",
+    require_lyrics: bool = False,
 ) -> str:
     requirements = [structured_prompt]
     if duration_minutes is not None:
@@ -122,7 +124,94 @@ def build_elevenlabs_prompt(
         )
     if lyrics:
         requirements.extend(["Original lyrics (preserve wording and line order):", lyrics])
+    if require_lyrics:
+        # 收起页没有用户歌词：明确要求写唱，避免风格里的“无歌词/哼唱”被理解成纯音乐。
+        requirements.append(
+            "Write and sing original lyrics with a clear lead vocal. "
+            "Do not generate an instrumental or wordless vocal track. "
+            "Hums or vocal chops may only be backing texture; "
+            "the lead vocal must sing actual lyrics."
+        )
     return "\n".join(requirements)
+
+
+def _composition_lyrics(plan: object) -> str | None:
+    """从 ElevenLabs 详细响应的 composition plan 里取实际唱出的歌词。"""
+    if not isinstance(plan, dict):
+        return None
+    chunks = plan.get("chunks")
+    if isinstance(chunks, list):
+        texts = [
+            chunk.get("text")
+            for chunk in chunks
+            if isinstance(chunk, dict) and isinstance(chunk.get("text"), str)
+        ]
+        text = "\n".join(value.strip() for value in texts if value.strip())
+        return text if _has_lyric_text(text) else None
+    sections = plan.get("sections")
+    if isinstance(sections, list):
+        lines: list[str] = []
+        for section in sections:
+            section_lines = section.get("lines") if isinstance(section, dict) else None
+            if isinstance(section_lines, list):
+                lines.extend(str(line).strip() for line in section_lines if str(line).strip())
+        text = "\n".join(lines)
+        return text if _has_lyric_text(text) else None
+    return None
+
+
+def _has_lyric_text(text: str) -> bool:
+    """去掉段落标签和花括号提示后还有没有真正要唱的字。"""
+    return bool(re.sub(r"\[[^\]]+\]|\{[^}]+\}", "", text).strip())
+
+
+def _parse_detailed_music(content: bytes, content_type: str) -> tuple[dict[str, Any], bytes]:
+    """拆分 ElevenLabs /v1/music/detailed 的 multipart：JSON 元数据 + 二进制音频。"""
+    marker = "boundary="
+    boundary = (
+        content_type.split(marker, 1)[1].split(";", 1)[0].strip().strip('"')
+        if marker in content_type
+        else ""
+    )
+    if not boundary:
+        return {}, b""
+    delimiter = f"--{boundary}".encode()
+    metadata: dict[str, Any] = {}
+    audio = b""
+    for part in content.split(delimiter)[1:]:
+        header, separator, body = part.partition(b"\r\n\r\n")
+        if not separator:
+            header, separator, body = part.partition(b"\n\n")
+        if not separator:
+            continue
+        body = body.removesuffix(b"\r\n").removesuffix(b"\n").removeprefix(b"\r\n")
+        if b"json" in header.lower():
+            try:
+                parsed = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                continue
+            if isinstance(parsed, dict):
+                metadata = parsed
+        elif len(body) > len(audio):
+            audio = body
+    return metadata, audio
+
+
+def _detailed_music_text(metadata: dict[str, Any]) -> tuple[str | None, str | None]:
+    song = metadata.get("song_metadata") or metadata.get("songMetadata") or {}
+    plan = metadata.get("composition_plan") or metadata.get("compositionPlan") or {}
+    title = song.get("title") if isinstance(song, dict) else None
+    lyrics = song.get("lyrics") if isinstance(song, dict) else None
+    if not isinstance(lyrics, str) or not lyrics.strip() or not _has_lyric_text(lyrics):
+        lyrics = _composition_lyrics(plan)
+    return (
+        title.strip() if isinstance(title, str) and title.strip() else None,
+        lyrics.strip() if isinstance(lyrics, str) and lyrics.strip() else None,
+    )
+
+
+async def _bytes_as_chunks(data: bytes) -> AsyncIterator[bytes]:
+    yield data
 
 
 def _audio_target(
@@ -149,6 +238,9 @@ class AudioReference:
 class MusicResult:
     audio_path: Path
     debug: dict[str, Any]
+    # Create 收起页没有用户歌词，服务商返回什么就存什么。
+    title: str | None = None
+    lyrics: str | None = None
 
 
 class MusicProvider(Protocol):
@@ -544,6 +636,7 @@ class ElevenLabsMusicProvider:
         progress: ProviderProgressCallback | None = None,
         job_id: str | None = None,
         reference: AudioReference | None = None,
+        direct_prompt: bool = False,
     ) -> MusicResult:
         if duration_seconds is not None and duration_seconds <= 0:
             raise GenerationError("ElevenLabs 音乐生成失败：目标时长必须大于 0 秒。")
@@ -568,6 +661,7 @@ class ElevenLabsMusicProvider:
             duration_seconds / 60 if duration_seconds is not None else None,
             clear_chinese,
             lyrics,
+            require_lyrics=direct_prompt and not lyrics and not force_instrumental,
         )
         output_format = self._settings.elevenlabs_music_output_format
         sample_rate = int(output_format.removeprefix("pcm_"))
@@ -578,7 +672,11 @@ class ElevenLabsMusicProvider:
         }
         if duration_seconds is not None:
             request_body["music_length_ms"] = duration_seconds * 1000
-        url = f"{self._settings.elevenlabs_music_base_url}/v1/music/stream"
+        url = (
+            f"{self._settings.elevenlabs_music_base_url}/v1/music/detailed"
+            if direct_prompt
+            else f"{self._settings.elevenlabs_music_base_url}/v1/music/stream"
+        )
         request_diagnostic = {
             "method": "POST",
             "url": url,
@@ -645,7 +743,33 @@ class ElevenLabsMusicProvider:
             await self._report_progress(
                 progress, "generating_music", expected_audio_seconds=expected_seconds
             )
+            title = None
+            generated_lyrics = None
             for attempt in range(2):
+                if direct_prompt:
+                    # detailed 是唯一同时返回音频与 song_metadata/歌词的接口。
+                    response = await self._client.post(
+                        url,
+                        json=request_body,
+                        params={"output_format": output_format},
+                        headers=self._headers(),
+                        timeout=self._settings.music_api_timeout_seconds,
+                    )
+                    response.raise_for_status()
+                    metadata, audio = _parse_detailed_music(
+                        response.content, response.headers.get("content-type", "")
+                    )
+                    if not audio:
+                        raise GenerationError("ElevenLabs 音乐生成失败：详细响应缺少音频。")
+                    actual_duration_seconds = await self._write_pcm_wav(
+                        _bytes_as_chunks(audio),
+                        target,
+                        sample_rate,
+                        expected_seconds,
+                        progress=progress,
+                    )
+                    title, generated_lyrics = _detailed_music_text(metadata)
+                    break
                 async with self._client.stream(
                     "POST",
                     url,
@@ -702,6 +826,8 @@ class ElevenLabsMusicProvider:
                         else {}
                     ),
                 },
+                title=title,
+                lyrics=generated_lyrics,
             )
         except GenerationError:
             raise
@@ -972,11 +1098,9 @@ class MiniMaxMusicProvider:
         del duration_seconds
         try:
             lyrics, _ = split_generation_prompt(user_prompt)
-            if not lyrics:
-                # The orchestrator always supplies prepared lyrics; keep this for direct callers.
-                raise GenerationError("MiniMax 音乐生成失败：缺少已准备好的歌词。")
-            lyrics = _wrap_long_lyric_lines(lyrics)
-            if len(lyrics) < 10:
+            has_prepared_lyrics = bool(lyrics)
+            lyrics = _wrap_long_lyric_lines(lyrics) if has_prepared_lyrics else user_prompt
+            if has_prepared_lyrics and len(lyrics) < 10:
                 raise GenerationError("MiniMax 音乐生成失败：生成的歌词不足 10 个字符。")
             target = _audio_target(
                 self._settings,
@@ -995,16 +1119,17 @@ class MiniMaxMusicProvider:
             }
             if job_id:
                 request_body["jobId"] = uuid5(NAMESPACE_URL, f"{job_id}:{variation}").hex
-            request_body["instructions"] += (
-                "\n[Lyric Fidelity: Sing every supplied non-tag lyric line exactly once, "
-                "verbatim, and in order. Never omit, repeat, paraphrase, invent, or replace "
-                "any lyric words.]"
-                "\n[Timing: Choose the natural complete song duration. Sing every supplied "
-                "lyric without cutting off the ending, then stop all vocals and finish with "
-                "only a short natural outro.]"
-                "\n[Vocal Ending: Never fill unused time with repeated or invented vocals, "
-                "humming, chants, ad-libs, or an extended instrumental outro.]"
-            )
+            if has_prepared_lyrics:
+                request_body["instructions"] += (
+                    "\n[Lyric Fidelity: Sing every supplied non-tag lyric line exactly once, "
+                    "verbatim, and in order. Never omit, repeat, paraphrase, invent, or replace "
+                    "any lyric words.]"
+                    "\n[Timing: Choose the natural complete song duration. Sing every supplied "
+                    "lyric without cutting off the ending, then stop all vocals and finish with "
+                    "only a short natural outro.]"
+                    "\n[Vocal Ending: Never fill unused time with repeated or invented vocals, "
+                    "humming, chants, ad-libs, or an extended instrumental outro.]"
+                )
             url = f"{self._settings.minimax_base_url}{MINIMAX_GENERATE_PATH}"
             request_diagnostic = {
                 "method": "POST",
@@ -1169,6 +1294,36 @@ class MurekaMusicProvider:
             raise ProviderGlobalError("Mureka 音乐生成失败：缺少 MUREKA_API_KEY 环境变量。")
         return {"Authorization": f"Bearer {secret.get_secret_value()}"}
 
+    async def _generate_lyrics(self, prompt: str) -> tuple[str | None, str]:
+        # 收起页直传没有歌词；Mureka 的歌词接口会同时给出歌名。
+        url = f"{self._settings.mureka_base_url}/v1/lyrics/generate"
+        try:
+            response = await self._client.post(
+                url,
+                json={"prompt": prompt},
+                headers=self._headers(),
+                timeout=self._settings.music_api_timeout_seconds,
+            )
+            response.raise_for_status()
+            data = response.json()
+        except httpx.HTTPStatusError as exc:
+            error_type = (
+                ProviderGlobalError
+                if exc.response.status_code in GLOBAL_PROVIDER_HTTP_STATUSES
+                else GenerationError
+            )
+            raise error_type(f"Mureka 歌词生成失败：{_http_failure_message(exc)}") from exc
+        except (httpx.HTTPError, ValueError) as exc:
+            raise GenerationError(f"Mureka 歌词生成失败：{_http_failure_message(exc)}") from exc
+        lyrics = data.get("lyrics") if isinstance(data, dict) else None
+        title = data.get("title") if isinstance(data, dict) else None
+        if not isinstance(lyrics, str) or not lyrics.strip():
+            raise GenerationError("Mureka 歌词生成失败：接口未返回歌词。")
+        return (
+            title.strip() if isinstance(title, str) and title.strip() else None,
+            lyrics.strip(),
+        )
+
     async def _reference_file_id(self, reference_id: str) -> str:
         return await remote_reference_id(
             self._settings.output_dir,
@@ -1243,8 +1398,13 @@ class MurekaMusicProvider:
         # Mureka has no length parameter; the song length follows the lyrics (max 5m30s).
         del duration_seconds
         lyrics, _ = split_generation_prompt(user_prompt)
+        song_title = None
         if not lyrics:
-            raise GenerationError("Mureka 音乐生成失败：缺少已准备好的歌词。")
+            if len(structured_prompt) > MUREKA_PROMPT_MAX_CHARS:
+                raise GenerationError(
+                    f"Mureka 风格说明不能超过 {MUREKA_PROMPT_MAX_CHARS} 个字符，请缩短后重试。"
+                )
+            song_title, lyrics = await self._generate_lyrics(structured_prompt)
         if len(lyrics) > MUREKA_LYRICS_MAX_CHARS:
             raise GenerationError(
                 f"Mureka 音乐生成失败：歌词长度 {len(lyrics)} 超过接口上限 "
@@ -1362,6 +1522,8 @@ class MurekaMusicProvider:
                     ),
                     **({"audioReferenceId": reference.song_id} if reference is not None else {}),
                 },
+                title=song_title,
+                lyrics=lyrics,
             )
         except GenerationError:
             raise

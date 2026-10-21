@@ -34,7 +34,9 @@ cp .env.example .env
 Blackwell `sm_120`；BS-RoFormer 和 RVC 共用这一套 CUDA 环境，不再安装 CPU Torch。
 运行拆轨或默认的 RVC 配置需要可用的 NVIDIA 驱动和 CUDA GPU。
 
-编辑 `.env`，至少配置 LLM Key。`MUSIC_PROVIDER` 只是请求未传 `provider` 时的默认值；
+编辑 `.env`，至少配置 LLM Key。`LLM_*` 用于展开页和 AI-talk；
+Create 收起页的中文风格扩写使用独立的 `STYLE_LLM_*`，未配置时回退到 `LLM_*`。
+`MUSIC_PROVIDER` 只是请求未传 `provider` 时的默认值；
 MiniMax 和 ElevenLabs 的配置可以同时保留。真实 ElevenLabs 模式还需要配置：
 
 ```env

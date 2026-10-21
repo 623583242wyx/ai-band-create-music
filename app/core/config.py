@@ -50,6 +50,7 @@ class Settings(BaseSettings):
     max_duration_minutes: int = Field(default=6, ge=1, le=6)
     max_concurrent_generations: int = Field(default=1, ge=1)
 
+    # 原有歌词/风格处理使用的 LLM（展开页、AI-talk、翻译）。
     llm_api_key: SecretStr | None = None
     llm_base_url: str = "https://api.openai.com/v1"
     llm_chat_completions_url: str = ""
@@ -58,6 +59,19 @@ class Settings(BaseSettings):
     llm_temperature: float = Field(default=0.2, ge=0, le=2)
     llm_max_tokens: int = Field(default=2048, ge=1, le=4096)
     llm_disable_thinking: bool = True
+
+    # Create 收起页的中文风格扩写使用独立 LLM；未配置时回退到上面的 LLM_*。
+    style_llm_api_key: SecretStr | None = None
+    style_llm_base_url: str = ""
+    style_llm_chat_completions_url: str = ""
+    style_llm_model: str = ""
+    style_llm_timeout_seconds: float | None = Field(default=None, gt=0)
+    style_llm_temperature: float | None = Field(default=None, ge=0, le=2)
+    style_llm_max_tokens: int | None = Field(default=None, ge=1, le=4096)
+    style_llm_response_format: Literal["json_schema", "json_object"] = "json_schema"
+    style_llm_enable_thinking: bool = False
+    style_llm_trust_env_proxy: bool = True
+    style_llm_max_attempts: int = Field(default=2, ge=1, le=5)
 
     music_api_mode: Literal["mock", "real"] = "mock"
     music_provider: Literal[
@@ -160,6 +174,7 @@ class Settings(BaseSettings):
     @field_validator(
         "public_base_url",
         "llm_base_url",
+        "style_llm_base_url",
         "elevenlabs_music_base_url",
         "minimax_base_url",
         "mureka_base_url",
@@ -180,6 +195,22 @@ class Settings(BaseSettings):
         return value
 
     @model_validator(mode="after")
+    def fill_style_llm_defaults(self) -> Settings:
+        if not self.style_llm_base_url:
+            self.style_llm_base_url = self.llm_base_url
+        if not self.style_llm_model:
+            self.style_llm_model = self.llm_model
+        if self.style_llm_api_key is None:
+            self.style_llm_api_key = self.llm_api_key
+        if self.style_llm_timeout_seconds is None:
+            self.style_llm_timeout_seconds = self.llm_timeout_seconds
+        if self.style_llm_temperature is None:
+            self.style_llm_temperature = self.llm_temperature
+        if self.style_llm_max_tokens is None:
+            self.style_llm_max_tokens = self.llm_max_tokens
+        return self
+
+    @model_validator(mode="after")
     def validate_duration_range(self) -> Settings:
         if self.max_duration_minutes < self.min_duration_minutes:
             raise ValueError("MAX_DURATION_MINUTES must be >= MIN_DURATION_MINUTES")
@@ -194,6 +225,10 @@ class Settings(BaseSettings):
     @property
     def llm_url(self) -> str:
         return self.llm_chat_completions_url or f"{self.llm_base_url}/chat/completions"
+
+    @property
+    def style_llm_url(self) -> str:
+        return self.style_llm_chat_completions_url or f"{self.style_llm_base_url}/chat/completions"
 
     @property
     def cors_origin_list(self) -> list[str]:

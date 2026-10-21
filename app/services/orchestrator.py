@@ -106,6 +106,7 @@ class GenerationOrchestrator:
         count: int = 1,
         title: str | None = None,
         reference: AudioReference | None = None,
+        direct_prompt: bool = False,
     ) -> dict[str, Any]:
         job_id = job_id or f"job_{int(time.time() * 1000)}_{uuid4().hex[:8]}"
         selected_provider = provider or self.settings.music_provider
@@ -187,26 +188,37 @@ class GenerationOrchestrator:
                 lyrics=None,
             )
             await self.events.publish(GenerationEvent("generation.started", job_id, request_id))
-            await report("expanding_prompt", None, "正在处理歌词与音乐风格")
-            _, style = split_generation_prompt(user_prompt)
-            prepared = await self.prompt_expander.prepare(
-                user_prompt,
-                effective_duration_minutes,
-                job_id=job_id,
-                title=title,
-            )
-            song_title = title or prepared.title
-            structured_prompt = prepared.structured_prompt
-            lyrics = prepared.lyrics
-            duration_seconds = prepared.duration_seconds
+            if direct_prompt:
+                # Create 收起页只提交用户确认的风格，不再自动扩写或生成歌词。
+                style = structured_prompt = user_prompt
+                lyrics = ""
+                song_title = title
+                duration_seconds = (
+                    round(effective_duration_minutes * 60)
+                    if effective_duration_minutes is not None
+                    else None
+                )
+            else:
+                await report("expanding_prompt", None, "正在处理歌词与音乐风格")
+                _, style = split_generation_prompt(user_prompt)
+                prepared = await self.prompt_expander.prepare(
+                    user_prompt,
+                    effective_duration_minutes,
+                    job_id=job_id,
+                    title=title,
+                )
+                song_title = title or prepared.title
+                structured_prompt = prepared.structured_prompt
+                lyrics = prepared.lyrics
+                duration_seconds = prepared.duration_seconds
             if duration_seconds is None and selected_provider not in {
                 "minimax_music",
                 "elevenlabs_music",
                 "mureka_music",
             }:
                 duration_seconds = self.settings.default_duration_minutes * 60
-            provider_prompt = f"[歌词与创作内容]\n{lyrics}"
-            if style:
+            provider_prompt = user_prompt if direct_prompt else f"[歌词与创作内容]\n{lyrics}"
+            if style and not direct_prompt:
                 provider_prompt += f"\n\n[风格要求]\n{style}"
             duration_diagnostics: dict[str, object] = {
                 "durationSource": (
@@ -251,6 +263,7 @@ class GenerationOrchestrator:
                 "lyrics": lyrics,
                 "requestedCount": count,
                 "provider": selected_provider,
+                "directPrompt": direct_prompt,
             }
             if duration_seconds is not None:
                 response["requestedDurationSeconds"] = duration_seconds
@@ -329,6 +342,11 @@ class GenerationOrchestrator:
                     )
 
                 try:
+                    provider_options: dict[str, Any] = (
+                        {"reference": reference} if reference is not None else {}
+                    )
+                    if direct_prompt and selected_provider == "elevenlabs_music":
+                        provider_options["direct_prompt"] = True
                     music_result = await music_provider.generate(
                         structured_prompt,
                         duration_seconds,
@@ -336,12 +354,31 @@ class GenerationOrchestrator:
                         variation=index,
                         progress=provider_progress,
                         job_id=job_id,
-                        # Only ElevenLabs and Mureka accept a reference; callers validate it.
-                        **({"reference": reference} if reference is not None else {}),
+                        **provider_options,
                     )
                     if task_progress is not None:
                         task_progress = min(99, int(song_number / effective_count * 100))
-                    await report("saving_audio", task_progress, f"正在保存第 {song_number} 首")
+                    if music_result.title and not song_title:
+                        song_title = music_result.title
+                    if music_result.lyrics and not lyrics:
+                        lyrics = music_result.lyrics
+                    response["title"] = song_title
+                    response["lyrics"] = lyrics
+                    if music_result.title or music_result.lyrics:
+                        # job.json 与 prompts.json 都留下服务商返回的歌名/歌词。
+                        update_job_diagnostics(
+                            self.settings.output_dir,
+                            job_id,
+                            title=song_title,
+                            lyrics=lyrics,
+                        )
+                    await report(
+                        "saving_audio",
+                        task_progress,
+                        f"正在保存第 {song_number} 首",
+                        title=song_title,
+                        lyrics=lyrics,
+                    )
                     song_dir = job_song_dir(self.settings.output_dir, job_id, index)
                     full_path = await ensure_file_under_root(
                         music_result.audio_path,
@@ -361,6 +398,7 @@ class GenerationOrchestrator:
                         "waveforms": await extract_waveforms({"full": full_path}),
                         "splitEnabled": False,
                         "durationSeconds": music_result.debug.get("durationSeconds"),
+                        **({"lyrics": music_result.lyrics} if music_result.lyrics else {}),
                         "debug": {"music": music_result.debug},
                     }
 

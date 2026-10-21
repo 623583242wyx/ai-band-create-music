@@ -69,6 +69,7 @@ class GenerateRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     prompt: str
+    directPrompt: bool = False
     durationMinutes: int | float | str | None = None
     # Exact short length (e.g. 30 s previews); takes precedence over durationMinutes.
     durationSeconds: int | None = Field(default=None, ge=10, le=360)
@@ -83,6 +84,14 @@ class GenerateRequest(BaseModel):
     @classmethod
     def normalize_title(cls, value: str | None) -> str | None:
         return value.strip() or None if value is not None else None
+
+
+class ExpandStyleRequest(BaseModel):
+    prompt: str = Field(min_length=1, max_length=2000)
+
+
+class ExpandStyleResponse(BaseModel):
+    style: str
 
 
 class ErrorResponse(BaseModel):
@@ -128,6 +137,8 @@ class MusicOutput(BaseModel):
     updatedAt: str | None = Field(default=None, exclude_if=lambda value: value is None)
     songNumber: int | None = Field(default=None, ge=1, le=2, exclude_if=lambda value: value is None)
     fullTrack: str
+    # 每首候选自己的歌词（收起页直传由服务商返回）；歌名只在 GenerateResponse 顶层。
+    lyrics: str | None = Field(default=None, exclude_if=lambda value: value is None)
     playback: PlaybackUrls | None = Field(default=None, exclude_if=lambda value: value is None)
     mixedTrack: str | None = Field(default=None, exclude_if=lambda value: value is None)
     replacedVocal: str | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -159,6 +170,7 @@ class GenerateResponse(MusicOutput):
     )
     prompt: str
     title: str | None = None
+    directPrompt: bool = False
     durationMinutes: int | float | Literal["auto"]
     structuredPrompt: str
     lyrics: str

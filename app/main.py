@@ -41,6 +41,8 @@ from app.infrastructure.queue import InlineTaskDispatcher
 from app.schemas import (
     CreateGenerationJobResponse,
     ErrorResponse,
+    ExpandStyleRequest,
+    ExpandStyleResponse,
     GenerateRequest,
     GenerateResponse,
     GenerationJobResponse,
@@ -465,9 +467,12 @@ def build_orchestrator(
         name: create_music_provider(settings, client, direct_client, name)
         for name in ("minimax_music", "elevenlabs_music", "mureka_music")
     }
+    style_client = (
+        client if settings.style_llm_trust_env_proxy else (direct_client or client)
+    )
     return GenerationOrchestrator(
         settings=settings,
-        prompt_expander=OpenAICompatiblePromptExpander(settings, client),
+        prompt_expander=OpenAICompatiblePromptExpander(settings, client, style_client),
         music_provider=music_providers.get(settings.music_provider)
         or create_music_provider(settings, client, direct_client),
         stem_separator=BSRoFormerStemSeparator(settings),
@@ -600,6 +605,12 @@ def create_app(
                 "timeoutSeconds": application_settings.llm_timeout_seconds,
                 "maxTokens": application_settings.llm_max_tokens,
                 "disableThinking": application_settings.llm_disable_thinking,
+                "styleExpansion": {
+                    "model": application_settings.style_llm_model,
+                    "timeoutSeconds": application_settings.style_llm_timeout_seconds,
+                    "maxTokens": application_settings.style_llm_max_tokens,
+                    "enableThinking": application_settings.style_llm_enable_thinking,
+                },
             },
             "elevenLabs": {
                 "modelId": application_settings.elevenlabs_music_model_id,
@@ -643,6 +654,18 @@ def create_app(
             },
             "retention": retention_status(request.app),
         }
+
+    @application.post("/api/styles/expand", response_model=ExpandStyleResponse)
+    async def expand_style(payload: ExpandStyleRequest, request: Request):
+        if not payload.prompt.strip():
+            return JSONResponse(
+                status_code=400, content={"success": False, "message": "请输入音乐风格"}
+            )
+        try:
+            style = await _orchestrator(request).prompt_expander.expand_style(payload.prompt)
+            return {"style": style}
+        except GenerationError as exc:
+            return JSONResponse(status_code=502, content={"success": False, "message": str(exc)})
 
     @application.post(
         "/api/generate",
@@ -717,6 +740,7 @@ def create_app(
                 count=payload.count,
                 title=job.title,
                 reference=reference,
+                direct_prompt=payload.directPrompt,
             )
             job.result = result
             job.status, job.stage, job.progress = "succeeded", "completed", 100
@@ -871,6 +895,7 @@ def create_app(
                     count=payload.count,
                     title=job.title,
                     reference=reference,
+                    direct_prompt=payload.directPrompt,
                 )
                 job.status = "succeeded"
                 job.result["createdAt"] = job.created_at
@@ -3247,8 +3272,8 @@ def _audio_io_error(exc: OSError, path: Path) -> HTTPException:
 def _generation_parameters(
     payload: GenerateRequest, settings: Settings
 ) -> tuple[str, int | float | None]:
-    prompt = payload.prompt.strip()
-    if not prompt:
+    prompt = payload.prompt if payload.directPrompt else payload.prompt.strip()
+    if not prompt.strip():
         raise ValueError("prompt 不能为空，请输入歌曲风格描述。")
     if len(prompt) > settings.prompt_max_chars:
         raise ValueError(f"prompt 不能超过 {settings.prompt_max_chars} 个字符。")
