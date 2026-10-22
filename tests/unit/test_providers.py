@@ -17,6 +17,7 @@ from app.services.providers import (
     GenericMusicProvider,
     MiniMaxMusicProvider,
     MurekaMusicProvider,
+    _detailed_music_text,
     _wrap_long_lyric_lines,
     create_music_provider,
     extract_generated_audio_url,
@@ -174,6 +175,63 @@ async def test_elevenlabs_sends_complete_prompt_and_streams_audio(tmp_path: Path
     assert "Mandarin Chinese lead vocals" in music_body["prompt"]
     assert music_body["music_length_ms"] == 3_000
     assert "composition_plan" not in music_body
+
+
+def test_elevenlabs_section_only_plan_is_not_lyrics() -> None:
+    metadata = {
+        "song_metadata": {"title": "After the Rain"},
+        "composition_plan": {
+            "chunks": [
+                {"text": "[Intro]"},
+                {"text": "[Build]"},
+                {"text": "{filtered rain texture}"},
+            ]
+        },
+    }
+    assert _detailed_music_text(metadata) == ("After the Rain", None)
+
+
+async def test_elevenlabs_direct_prompt_reads_detailed_metadata(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+    pcm = b"\x00\x00\x01\x00" * 24_000
+    boundary = "music-boundary"
+    metadata = {
+        "song_metadata": {"title": "雨夜"},
+        "composition_plan": {"chunks": [{"text": "[Verse]\n第一句"}, {"text": "[Chorus]\n第二句"}]},
+    }
+    body = (
+        f"--{boundary}\r\nContent-Type: application/json\r\n\r\n"
+        f"{json.dumps(metadata, ensure_ascii=False)}\r\n"
+        f"--{boundary}\r\nContent-Type: audio/pcm\r\n\r\n"
+    ).encode() + pcm + f"\r\n--{boundary}--\r\n".encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            stream=ChunkedBody(body[:37], body[37:51], body[51:200], body[200:]),
+            headers={"content-type": f"multipart/mixed; boundary={boundary}"},
+        )
+
+    settings = make_settings(
+        tmp_path,
+        elevenlabs_api_key="secret",
+        elevenlabs_music_base_url="https://eleven.test",
+        elevenlabs_music_output_format="pcm_8000",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await ElevenLabsMusicProvider(settings, client).generate(
+            "[Genre: Folk]", 3, "温暖民谣", direct_prompt=True, job_id="direct-job"
+        )
+
+    assert requests[0].url.path == "/v1/music/detailed"
+    assert "Write and sing original lyrics with a clear lead vocal" in json.loads(
+        requests[0].content
+    )["prompt"]
+    assert result.title == "雨夜"
+    assert result.lyrics == "[Verse]\n第一句\n[Chorus]\n第二句"
+    with wave.open(str(result.audio_path), "rb") as audio:
+        assert audio.readframes(audio.getnframes()) == pcm
 
 
 @pytest.mark.parametrize("duration_seconds", [3, None])
@@ -630,6 +688,16 @@ async def test_generic_provider_accepts_direct_audio_url(tmp_path: Path) -> None
     assert result.debug["mode"] == "direct_audio_url"
 
 
+async def test_minimax_provider_requires_prepared_lyrics(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail("MiniMax must not be called without prepared lyrics")
+
+    settings = make_settings(tmp_path, minimax_base_url="https://minimax.test")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(GenerationError, match="缺少歌词"):
+            await MiniMaxMusicProvider(settings, client).generate("rock", None, "rock")
+
+
 async def test_minimax_provider_omits_duration_for_auto(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
@@ -869,6 +937,49 @@ async def test_mureka_uploads_reference_once_polls_and_downloads_wav(tmp_path: P
     }
 
 
+async def test_mureka_direct_prompt_generates_lyrics_and_title(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path == "/v1/lyrics/generate":
+            return httpx.Response(200, json={"title": "雨夜", "lyrics": "[Verse]\n第一句"})
+        if path == "/v1/song/generate":
+            return httpx.Response(200, json={"id": "task-1", "status": "preparing"})
+        if path == "/v1/song/query/task-1":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "task-1",
+                    "status": "succeeded",
+                    "choices": [
+                        {
+                            "id": "song-1",
+                            "url": "https://cdn.test/a.mp3",
+                            "duration": 1000,
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, content=b"mp3-bytes")
+
+    settings = make_settings(tmp_path, mureka_api_key="test", music_poll_interval_seconds=0)
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await MurekaMusicProvider(settings, client).generate(
+            "温暖民谣", None, "温暖民谣"
+        )
+
+    assert result.title == "雨夜"
+    assert result.lyrics == "[Verse]\n第一句"
+    lyrics_request = next(r for r in requests if r.url.path == "/v1/lyrics/generate")
+    assert json.loads(lyrics_request.content) == {"prompt": "温暖民谣"}
+    song_request = next(r for r in requests if r.url.path == "/v1/song/generate")
+    body = json.loads(song_request.content)
+    assert body["lyrics"] == "[Verse]\n第一句"
+    assert body["prompt"] == "温暖民谣"
+
+
 @pytest.mark.parametrize("status", [401, 429, 500])
 async def test_mureka_classifies_http_errors(tmp_path: Path, status: int) -> None:
     settings = make_settings(tmp_path, mureka_api_key="test")
@@ -951,3 +1062,54 @@ async def test_mureka_loops_short_reference_to_30_seconds(tmp_path: Path) -> Non
     assert sorted(path.name for path in clip.parent.iterdir() if path.suffix != ".lock") == sorted(
         [clip.name, "index.json"]
     )
+
+async def test_elevenlabs_detailed_multipart_handles_preamble_and_extra_parts(
+    tmp_path: Path,
+) -> None:
+    pcm = b"\x00\x00\x01\x00" * 24_000
+    boundary = "music-boundary"
+    metadata = {
+        "song_metadata": {"title": "雨后"},
+        "composition_plan": {"chunks": [{"text": "[Verse]\n第一句"}]},
+    }
+    extra = {"words_timestamps": [{"word": "雨", "start_ms": 0}]}
+    body = (
+        b"preamble before the first boundary\r\n"
+        + f"--{boundary}\r\nContent-Type: binary/octet-stream\r\n\r\n".encode()
+        + pcm
+        + b"\r\n"
+        + f"--{boundary}\r\nContent-Type: application/json\r\n\r\n".encode()
+        + json.dumps(metadata, ensure_ascii=False).encode()
+        + b"\r\n"
+        + f"--{boundary}\r\nContent-Type: application/json\r\n\r\n".encode()
+        + json.dumps(extra, ensure_ascii=False).encode()
+        + b"\r\n"
+        + f"--{boundary}\r\nContent-Type: application/json\r\n\r\n".encode()
+        + b'[{"word": "ignored"}]\r\n'
+        + f"--{boundary}\r\nContent-Type: text/plain\r\n\r\n".encode()
+        + b"ignored extra part\r\n"
+        + f"--{boundary}--\r\n".encode()
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            stream=ChunkedBody(body[:1], body[1:41], body[41:333], body[333:]),
+            headers={"content-type": f"multipart/mixed; boundary={boundary}"},
+        )
+
+    settings = make_settings(
+        tmp_path,
+        elevenlabs_api_key="secret",
+        elevenlabs_music_base_url="https://eleven.test",
+        elevenlabs_music_output_format="pcm_8000",
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        result = await ElevenLabsMusicProvider(settings, client).generate(
+            "[Genre: Folk]", 3, "温暖民谣", direct_prompt=True, job_id="multipart-job"
+        )
+
+    assert result.title == "雨后"
+    assert result.lyrics == "[Verse]\n第一句"
+    with wave.open(str(result.audio_path), "rb") as audio:
+        assert audio.readframes(audio.getnframes()) == pcm

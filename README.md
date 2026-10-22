@@ -34,7 +34,25 @@ cp .env.example .env
 Blackwell `sm_120`；BS-RoFormer 和 RVC 共用这一套 CUDA 环境，不再安装 CPU Torch。
 运行拆轨或默认的 RVC 配置需要可用的 NVIDIA 驱动和 CUDA GPU。
 
-编辑 `.env`，至少配置 LLM Key。`MUSIC_PROVIDER` 只是请求未传 `provider` 时的默认值；
+编辑 `.env`，至少配置 LLM Key。`LLM_*` 用于展开页和 AI-talk；
+Create 收起页的中文风格扩写使用独立的 `STYLE_LLM_*`，整段未配置时回退到 `LLM_*`；
+回退时沿用主 LLM 的 JSON/thinking 约定（Doubao/OpenAI 使用 `json_object`，其它主端点不发
+`response_format`）。显式配置 `STYLE_LLM_BASE_URL` 即视为独立端点，即使与主 LLM 同地址也不会
+继承主 Key；需要鉴权时设置 `STYLE_LLM_API_KEY`。
+例如本地 Qwen（按实际地址调整，空 Key 表示端点不需要鉴权）：
+
+```env
+STYLE_LLM_API_KEY=
+STYLE_LLM_BASE_URL=http://127.0.0.1:8000/v1
+STYLE_LLM_MODEL=Qwen/Qwen3.5-9B-FP8
+STYLE_LLM_TIMEOUT_SECONDS=30
+STYLE_LLM_TEMPERATURE=0.7
+STYLE_LLM_RESPONSE_FORMAT=json_schema
+STYLE_LLM_ENABLE_THINKING=false
+STYLE_LLM_TRUST_ENV_PROXY=false
+```
+
+`MUSIC_PROVIDER` 只是请求未传 `provider` 时的默认值；
 MiniMax 和 ElevenLabs 的配置可以同时保留。真实 ElevenLabs 模式还需要配置：
 
 ```env
@@ -88,6 +106,11 @@ ElevenLabs 直接接收完整的结构化歌词和扩充风格标签，由模型
   例如后端为 30 MB 时，nginx 可设置 `client_max_body_size 32m;`，其它代理层也需同步检查。
   若小于后端上限的文件仍返回 413，应检查网关限制，不能只调整应用配置。
 
+> MiniMax 功能暂时停止维护。收起页直传（`directPrompt=true`）会返回 400；
+> 展开页/AI-talk 的既有歌词路径保留但不再保证。建议使用 Mureka 或 ElevenLabs。
+> `Settings.music_provider` 的代码默认值仍是 `minimax_music` 以兼容旧部署；
+> 新部署请显式设置 `MUSIC_PROVIDER=mureka_music`（`.env.example` 已如此）。
+
 自部署 MiniMax Music 3 使用兼容的 `/v1/audio/jobs` 接口：
 
 ```env
@@ -118,7 +141,8 @@ MUREKA_MODEL=mureka-9.5
 ```
 
 后端调用 `POST /v1/song/generate`（`lyrics` 为 LLM 歌词，`prompt` 为结构化风格描述，
-超过 1024 字符时截断；`n=1`，请求两首时独立调用两次），再轮询
+超过 1024 字符时截断（直传与非直传一致，结果 `debug.music.styleTruncated` 和 `warning` 会标记）；
+`n=1`，请求两首时独立调用两次），再轮询
 `GET /v1/song/query/{task_id}`，优先下载 `wav_url`，没有时下载 MP3 `url`。
 Mureka 没有时长参数，与 MiniMax 一样忽略固定时长，歌曲最长 5 分 30 秒。
 价格见 <https://platform.mureka.ai/pricing>（`mureka-9.5` 每首 $0.15，`mureka-9` / `mureka-8` /
@@ -414,6 +438,11 @@ curl -X POST http://127.0.0.1:8010/api/generate \
 群聊里选定的歌曲名；未传时会在歌词与风格扩写时生成简短歌名。标题随任务持久化，
 并由 `GET /api/jobs` 和任务 SSE 返回，供历史页显示。
 
+`directPrompt: true` 表示收起页直传：`prompt` 就是用户确认的风格，后端跳过 LLM 扩写与翻译；
+ElevenLabs 从 detailed 元数据、Mureka 从歌词接口保存歌名和歌词。`alternatives[].lyrics`
+保存每首候选自己的歌词（展开页的歌词在顶层 `lyrics`）。MiniMax 功能暂时停止维护，
+收起页直传会返回 400。
+
 前端使用异步任务接口，以便刷新后恢复任务并显示真实阶段进度：
 
 | 方法 | 路径 | 语义 |
@@ -422,6 +451,7 @@ curl -X POST http://127.0.0.1:8010/api/generate \
 | `GET` | `/api/jobs` | 列出全部历史任务（不含波形数据） |
 | `GET` | `/api/jobs/{jobId}` | 查询任务状态与结果 |
 | `GET` | `/api/jobs/{jobId}/events` | 通过 SSE 接收任务阶段和终态 |
+| `POST` | `/api/styles/expand` | 收起页 AI 风格扩写（独立 `STYLE_LLM_*`） |
 | `PATCH` | `/api/jobs/{jobId}` | 局部更新任务状态（当前用于取消） |
 | `DELETE` | `/api/jobs/{jobId}/stems/{stemId}` | 删除指定分轨及其输出文件 |
 | `PUT` | `/api/jobs/{jobId}/stems/{stemId}` | 撤回删除并恢复指定分轨 |
@@ -433,7 +463,10 @@ SSE 终态始终使用具名 `done` 事件，客户端收到后应主动关闭 E
 "message":"歌曲已过期。"}`，不包含音频结果；`expired` 仅表示该 SSE 终态的原因，
 不会写入任务的持久化状态。连接前已过期的任务仍返回 HTTP 404。
 
-ElevenLabs 优先使用 `/v1/music/stream`，收到首块音频前显示等待状态；接收期间
+ElevenLabs 展开页优先使用 `/v1/music/stream`；收起页直传使用 `/v1/music/detailed`，
+multipart 按 boundary 增量解析，音频边收边写，不整包缓冲。`detailed` 需要账号套餐支持：
+服务端返回 402/403/404/405 时直传会直接报错，不会回退到 `stream`（回退会丢失歌名和歌词）。
+收到首块音频前显示等待状态；接收期间
 `stage=receiving_audio`，`receivedAudioSeconds` 表示当前这一首已收到的 PCM 音频秒数，
 `expectedAudioSeconds` 表示请求的目标秒数（自动时长为 `null`）。进度更新通常最多每秒一次，
 首块立即推送，流结束并原子保存音频后补齐最后一次更新。固定时长的 `progress` 按整个任务

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
+from pydantic import SecretStr
 
 from app.core.config import Settings
 from app.core.errors import GenerationError
@@ -42,12 +43,17 @@ STYLE_TAG_REQUIREMENTS = "\n".join(
         "每个标签严格使用 [Category: value] 格式。",
         "整体覆盖 Genre and Era、Tempo and Meter、Mood、Instrumentation、Vocal、"
         "Arrangement、Production and Mix、Negative Constraints；允许在同一标签中合并相邻类别。",
-        "标签值应包含可听见、可执行的细节，例如 BPM、律动、音色、中文人声唱法、"
-        "段落推进、空间效果、动态变化和需要避免的声音。",
+        "标签值应包含可听见、可执行的细节，例如 BPM、拍号、律动/切分、调式/音阶、"
+        "音程走向、音色、中文人声唱法、段落推进、空间效果、动态变化和需要避免的声音。",
+        "Tempo and Meter（节奏与拍号）标签除 BPM 和拍号外，必须写明律动/切分与"
+        "调式/音阶、音程走向等旋律节奏特征。",
         "每个原始标签值不超过 200 个字符；需要合并时仍须保持信息完整。",
         "严格遵守用户提供的风格要求，不得替换或违背；"
         "为未指定项补充协调一致的专业选择；不得引用具体艺人或受版权保护作品。",
-        "Negative Constraints 禁止出现 no lyrics、no vocals 或 no melody。",
+        "Vocal 标签必须描述可演唱的主唱（音色、唱法、语言）；"
+        "禁止出现 no lyrics、no vocals、instrumental、wordless vocal，以及「无歌词」"
+        "「纯音乐」「无人声」「仅哼唱」等排除歌词的描述。"
+        "Negative Constraints 也不得包含这些排除人声的词。",
     ]
 )
 
@@ -109,6 +115,11 @@ FORBIDDEN_LYRICS_CONSTRAINT_PATTERN = re.compile(
     r"vocals?|melody(?:\s+generation)?)\b",
     re.IGNORECASE,
 )
+NO_VOCAL_STYLE_PATTERN = re.compile(
+    r"无歌词|没有歌词|纯音乐|无人声|无演唱|仅(?:使用[^，。；\n]{0,12})?哼唱|"
+    r"不要人声|vocal\s*chops|instrumental|wordless|no\s+(?:lyrics|vocals?)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +139,8 @@ class PromptExpander(Protocol):
         job_id: str | None = None,
         title: str | None = None,
     ) -> PreparedPrompt: ...
+
+    async def expand_style(self, prompt: str) -> str: ...
 
 
 def split_generation_prompt(user_prompt: str) -> tuple[str, str]:
@@ -401,9 +414,131 @@ def is_expanded_music_prompt(structured_prompt: str) -> bool:
 
 
 class OpenAICompatiblePromptExpander:
-    def __init__(self, settings: Settings, client: httpx.AsyncClient) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        client: httpx.AsyncClient,
+        style_client: httpx.AsyncClient | None = None,
+    ) -> None:
         self._settings = settings
         self._client = client
+        self._style_client = style_client or client
+
+    @staticmethod
+    def _auth_headers(api_key: SecretStr | None) -> dict[str, str]:
+        """空 API Key 不发送 Authorization；空 Bearer 会被 httpx 拒绝。"""
+        headers = {"Content-Type": "application/json"}
+        key = api_key.get_secret_value().strip() if api_key else ""
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        return headers
+
+    async def expand_style(self, prompt: str) -> str:
+        return await self._style_completion(STYLE_ONLY_SYSTEM_PROMPT, prompt)
+
+    async def _style_completion(
+        self,
+        system: str,
+        prompt: str,
+    ) -> str:
+        settings = self._settings
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+        schema = {
+            "type": "object",
+            "properties": {"styleTags": {"type": "string"}},
+            "required": ["styleTags"],
+            "additionalProperties": False,
+        }
+        client = self._style_client
+        url = settings.style_llm_url
+        model = settings.style_llm_model
+        temperature = settings.style_llm_temperature
+        max_tokens = settings.style_llm_max_tokens
+        timeout_seconds = settings.style_llm_timeout_seconds
+        api_key = settings.style_llm_api_key
+        max_attempts = settings.style_llm_max_attempts
+        response_format: dict[str, Any] | None = None
+        body_extra: dict[str, Any] = {}
+        if settings.style_llm_inherits_main:
+            # 与主 prepare 的条件保持一致：只有 Doubao/OpenAI 才发 json_object。
+            if settings.llm_disable_thinking:
+                if "qwen3" in model.lower():
+                    body_extra["chat_template_kwargs"] = {"enable_thinking": False}
+                elif "doubao" in model.lower():
+                    body_extra["thinking"] = {"type": "disabled"}
+            if "doubao" in model.lower() or settings.llm_url.startswith(
+                "https://api.openai.com/"
+            ):
+                response_format = {"type": "json_object"}
+        else:
+            response_format = (
+                {
+                    "type": "json_schema",
+                    "json_schema": {"name": "music_style", "strict": True, "schema": schema},
+                }
+                if settings.style_llm_response_format == "json_schema"
+                else {"type": "json_object"}
+            )
+            if "qwen3" in model.lower() or settings.style_llm_enable_thinking:
+                body_extra["chat_template_kwargs"] = {
+                    "enable_thinking": settings.style_llm_enable_thinking
+                }
+        body: dict[str, Any] = {
+            "model": model,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "messages": messages,
+            **body_extra,
+        }
+        if response_format is not None:
+            body["response_format"] = response_format
+        headers = self._auth_headers(api_key)
+        reason = ""
+        for attempt in range(max_attempts):
+            if attempt:
+                body["messages"] = [
+                    *messages,
+                    {
+                        "role": "user",
+                        "content": f"上次响应未满足要求：{reason}。请修正，只返回 JSON。",
+                    },
+                ]
+            try:
+                response = await client.post(
+                    url,
+                    json=body,
+                    headers=headers,
+                    timeout=httpx.Timeout(
+                        timeout_seconds,
+                        connect=min(10, timeout_seconds),
+                    ),
+                )
+                response.raise_for_status()
+                content = response.json()["choices"][0]["message"]["content"]
+                style = extract_json_object(content).get("styleTags")
+                if not isinstance(style, str) or not style.strip():
+                    raise ValueError("风格说明必须为非空字符串")
+                # 中文模型常用全角冒号，先统一标签分隔符再校验。
+                style = re.sub(
+                    r"\[([^\[\]:：\r\n]+)[:：]\s*",
+                    lambda match: f"[{match[1].strip()}: ",
+                    style,
+                )
+                validate_chinese_style(style)
+                style = "\n".join(
+                    f"{category}：{value.strip()}"
+                    for category, value in re.findall(
+                        r"\[([^:\[\]\n]+):\s*([^\[\]\n]+)\]", style
+                    )
+                )
+                if len(style) > 2000:
+                    raise ValueError("风格说明不能超过 2000 个字符")
+                return style
+            except httpx.HTTPError as exc:
+                raise GenerationError(f"风格处理失败：{_http_failure_message(exc)}") from exc
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                reason = str(exc)
+        raise GenerationError(f"风格处理失败：{reason}")
 
     async def prepare(
         self,
@@ -495,12 +630,7 @@ class OpenAICompatiblePromptExpander:
                     response = await self._client.post(
                         self._settings.llm_url,
                         json=request_body,
-                        headers={
-                            "Authorization": (
-                                f"Bearer {self._settings.llm_api_key.get_secret_value()}"
-                            ),
-                            "Content-Type": "application/json",
-                        },
+                        headers=self._auth_headers(self._settings.llm_api_key),
                         timeout=httpx.Timeout(
                             self._settings.llm_timeout_seconds,
                             connect=min(10, self._settings.llm_timeout_seconds),
@@ -631,3 +761,48 @@ def _http_failure_message(error: Exception) -> str:
             message = response.text.strip()
         return f"HTTP {response.status_code}{f': {message}' if message else ''}"
     return str(error) or error.__class__.__name__
+
+
+CHINESE_STYLE_CATEGORIES = {
+    "曲风与年代": "Genre and Era",
+    "节奏与拍号": "Tempo and Meter",
+    "情绪": "Mood",
+    "配器": "Instrumentation",
+    "人声": "Vocal",
+    "编排": "Arrangement",
+    "制作与混音": "Production and Mix",
+    "避免事项": "Negative Constraints",
+}
+STYLE_ONLY_SYSTEM_PROMPT = "\n".join(
+    [
+        "你是专业音乐制作人，只扩写用户的音乐风格，不生成歌词正文、歌名或任何演唱内容。",
+        STYLE_TAG_REQUIREMENTS.replace("详细英文音乐制作标签", "详细中文音乐制作标签").replace(
+            "Genre and Era、Tempo and Meter、Mood、Instrumentation、Vocal、"
+            "Arrangement、Production and Mix、Negative Constraints",
+            "曲风与年代、节奏与拍号、情绪、配器、人声、编排、制作与混音、避免事项",
+        ),
+        "用简体中文输出八个风格标签，类别依次为：" + "、".join(CHINESE_STYLE_CATEGORIES) + "。",
+        "Category 和 value 均使用中文，格式为 [类别: 内容]；保留必要的 BPM、拍号、"
+        "乐器与音阶/调式缩写。",
+        "「节奏与拍号」标签要写清 BPM、拍号、律动/切分，并补充调式/音阶与音程走向。",
+        "人声标签必须描述可演唱的普通话主唱；禁止写"
+        "「无歌词演唱」「纯音乐」「无人声」「仅哼唱」「Vocal Chops」等排除歌词的描述。",
+        "风格标签合计不得超过 2000 个字符。只返回 JSON 对象，唯一字段 styleTags 为字符串。",
+    ]
+)
+
+
+def validate_chinese_style(style: str) -> None:
+    translated = style
+    for chinese, english in CHINESE_STYLE_CATEGORIES.items():
+        translated = translated.replace(f"[{chinese}:", f"[{english}:")
+    error = music_prompt_validation_error(translated)
+    if error:
+        raise ValueError(error)
+    for category, value in re.findall(r"\[([^:\[\]\n]+):\s*([^\[\]\n]+)\]", style):
+        if category not in CHINESE_STYLE_CATEGORIES or not re.search(r"[\u4e00-\u9fff]", value):
+            raise ValueError("风格类别和说明必须使用中文")
+        if category == "人声" and NO_VOCAL_STYLE_PATTERN.search(value):
+            raise ValueError(
+                "人声标签必须描述可演唱的主唱，不能写无歌词、纯音乐、无人声或仅哼唱"
+            )

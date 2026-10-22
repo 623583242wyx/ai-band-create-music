@@ -107,3 +107,62 @@ def test_invalid_retention_days_rejected_from_environment(monkeypatch, days):
 def test_song_retention_days_are_bounded(tmp_path, days):
     with pytest.raises(ValidationError):
         make_settings(tmp_path, song_retention_days=days)
+
+def test_style_llm_falls_back_to_main_llm(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path, llm_model="gpt-test", llm_timeout_seconds=99, llm_temperature=0.3
+    )
+    assert settings.style_llm_model == "gpt-test"
+    assert settings.style_llm_timeout_seconds == 99
+    assert settings.style_llm_temperature == 0.3
+    assert settings.style_llm_base_url == settings.llm_base_url
+    assert settings.style_llm_api_key == settings.llm_api_key
+    assert settings.style_llm_inherits_main is True
+
+
+def test_style_llm_blank_key_falls_back_only_without_independent_endpoint(
+    tmp_path: Path,
+) -> None:
+    fallback = make_settings(tmp_path, llm_api_key="main-key", style_llm_api_key="")
+    assert fallback.style_llm_api_key.get_secret_value() == "main-key"
+
+    independent = make_settings(
+        tmp_path,
+        llm_api_key="main-key",
+        style_llm_api_key="",
+        style_llm_base_url="http://style.test/v1",
+    )
+    assert independent.style_llm_api_key.get_secret_value() == ""
+
+
+def test_style_llm_url_inherits_main_chat_completions_url(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        llm_chat_completions_url="https://main.test/v1/chat/completions",
+    )
+    assert settings.style_llm_url == settings.llm_url
+
+
+def test_style_llm_base_url_ignores_main_chat_completions_url(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        llm_chat_completions_url="https://main.test/v1/chat/completions",
+        style_llm_base_url="http://style.test/v1",
+        style_llm_model="qwen-test",
+    )
+    assert settings.style_llm_url == "http://style.test/v1/chat/completions"
+
+
+def test_style_llm_overrides_main_llm_independently(tmp_path: Path) -> None:
+    settings = make_settings(
+        tmp_path,
+        llm_model="gpt-test",
+        style_llm_model="qwen-test",
+        style_llm_base_url="http://style.test/v1",
+        style_llm_temperature=0.7,
+    )
+    assert settings.llm_model == "gpt-test"
+    assert settings.style_llm_model == "qwen-test"
+    assert settings.style_llm_temperature == 0.7
+    assert settings.style_llm_url == "http://style.test/v1/chat/completions"
+    assert settings.style_llm_inherits_main is False

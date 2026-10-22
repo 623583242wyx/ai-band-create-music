@@ -695,6 +695,35 @@ async def test_prepare_rejects_missing_llm_key_before_request(tmp_path: Path) ->
             await OpenAICompatiblePromptExpander(settings, client).prepare("[风格要求]\n男声摇滚")
 
 
+async def test_prepare_allows_blank_llm_key_without_authorization_header(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        assert "authorization" not in request.headers
+        content = json.dumps(
+            {
+                "taggedLyrics": "[Verse]\n第一句\n第二句",
+                "styleTags": EXPANDED_MANDARIN_ROCK_PROMPT,
+                "title": "测试歌名",
+            }
+        )
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
+
+    settings = make_settings(tmp_path, llm_api_key="")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        prepared = await OpenAICompatiblePromptExpander(settings, client).prepare(
+            "[风格要求]\n普通话摇滚"
+        )
+
+    assert len(requests) == 1
+    assert "authorization" not in requests[0].headers
+    assert prepared.title == "测试歌名"
+    assert "第一句" in prepared.lyrics
+
+
 async def test_prepare_retries_concise_style_and_adds_missing_verse_tag(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 

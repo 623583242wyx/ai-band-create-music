@@ -78,6 +78,7 @@ class StubMusicProvider:
         variation: int = 0,
         progress=None,
         job_id=None,
+        direct_prompt: bool = False,
     ) -> MusicResult:
         self.user_prompt = user_prompt
         self.variations.append(variation)
