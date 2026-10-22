@@ -210,6 +210,36 @@ async def test_direct_provider_metadata_is_saved_to_job_json(tmp_path: Path):
     assert job["title"] == "雨夜"
     assert job["lyrics"] == "[Verse]\n第一句"
 
+async def test_second_candidate_lyrics_do_not_fill_top_level(tmp_path: Path):
+    settings = make_settings(tmp_path)
+    orchestrator = make_orchestrator(settings)
+
+    async def mixed(style, duration, raw_prompt, *, variation=0, **kwargs):
+        return MusicResult(
+            settings.mock_full_song_path,
+            {"provider": "elevenlabs_music"},
+            lyrics=None if variation == 0 else "[Verse]\n第二首",
+        )
+
+    orchestrator.music_provider.generate = mixed
+    app = create_app(settings, orchestrator)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/generate",
+            json={
+                "prompt": "温暖民谣",
+                "provider": "elevenlabs_music",
+                "directPrompt": True,
+                "count": 2,
+            },
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["lyrics"] == ""
+    assert body["alternatives"][0]["lyrics"] == "[Verse]\n第二首"
+
 def test_chinese_style_rejects_no_vocal_human_tag():
     no_vocal = RAW_CHINESE_STYLE.replace(
         "[人声: 温暖清晰的民谣制作要求]",

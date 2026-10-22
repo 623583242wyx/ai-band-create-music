@@ -464,7 +464,9 @@ SSE 终态始终使用具名 `done` 事件，客户端收到后应主动关闭 E
 不会写入任务的持久化状态。连接前已过期的任务仍返回 HTTP 404。
 
 ElevenLabs 展开页优先使用 `/v1/music/stream`；收起页直传使用 `/v1/music/detailed`，
-multipart 按 boundary 增量解析，音频边收边写，不整包缓冲。收到首块音频前显示等待状态；接收期间
+multipart 按 boundary 增量解析，音频边收边写，不整包缓冲。`detailed` 需要账号套餐支持：
+服务端返回 402/403/404/405 时直传会直接报错，不会回退到 `stream`（回退会丢失歌名和歌词）。
+收到首块音频前显示等待状态；接收期间
 `stage=receiving_audio`，`receivedAudioSeconds` 表示当前这一首已收到的 PCM 音频秒数，
 `expectedAudioSeconds` 表示请求的目标秒数（自动时长为 `null`）。进度更新通常最多每秒一次，
 首块立即推送，流结束并原子保存音频后补齐最后一次更新。固定时长的 `progress` 按整个任务

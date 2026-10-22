@@ -434,14 +434,12 @@ class OpenAICompatiblePromptExpander:
         return headers
 
     async def expand_style(self, prompt: str) -> str:
-        return await self._style_completion(STYLE_ONLY_SYSTEM_PROMPT, prompt, chinese=True)
+        return await self._style_completion(STYLE_ONLY_SYSTEM_PROMPT, prompt)
 
     async def _style_completion(
         self,
         system: str,
         prompt: str,
-        *,
-        chinese: bool = False,
     ) -> str:
         settings = self._settings
         messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
@@ -456,7 +454,7 @@ class OpenAICompatiblePromptExpander:
         model = settings.style_llm_model
         temperature = settings.style_llm_temperature
         max_tokens = settings.style_llm_max_tokens
-        timeout_seconds = settings.style_llm_timeout_seconds or settings.llm_timeout_seconds
+        timeout_seconds = settings.style_llm_timeout_seconds
         api_key = settings.style_llm_api_key
         max_attempts = settings.style_llm_max_attempts
         response_format: dict[str, Any] | None = None
@@ -518,27 +516,23 @@ class OpenAICompatiblePromptExpander:
                 response.raise_for_status()
                 content = response.json()["choices"][0]["message"]["content"]
                 style = extract_json_object(content).get("styleTags")
-                limit = 2000 if chinese else 3600
                 if not isinstance(style, str) or not style.strip():
                     raise ValueError("风格说明必须为非空字符串")
-                if chinese:
-                    # 中文模型常用全角冒号，先统一标签分隔符再校验。
-                    style = re.sub(
-                        r"\[([^\[\]:：\r\n]+)[:：]\s*",
-                        lambda match: f"[{match[1].strip()}: ",
-                        style,
+                # 中文模型常用全角冒号，先统一标签分隔符再校验。
+                style = re.sub(
+                    r"\[([^\[\]:：\r\n]+)[:：]\s*",
+                    lambda match: f"[{match[1].strip()}: ",
+                    style,
+                )
+                validate_chinese_style(style)
+                style = "\n".join(
+                    f"{category}：{value.strip()}"
+                    for category, value in re.findall(
+                        r"\[([^:\[\]\n]+):\s*([^\[\]\n]+)\]", style
                     )
-                    validate_chinese_style(style)
-                    style = "\n".join(
-                        f"{category}：{value.strip()}"
-                        for category, value in re.findall(
-                            r"\[([^:\[\]\n]+):\s*([^\[\]\n]+)\]", style
-                        )
-                    )
-                elif re.search(r"[\u4e00-\u9fff]", style):
-                    raise ValueError("风格说明必须完整翻译为英文")
-                if len(style) > limit:
-                    raise ValueError(f"风格说明不能超过 {limit} 个字符")
+                )
+                if len(style) > 2000:
+                    raise ValueError("风格说明不能超过 2000 个字符")
                 return style
             except httpx.HTTPError as exc:
                 raise GenerationError(f"风格处理失败：{_http_failure_message(exc)}") from exc

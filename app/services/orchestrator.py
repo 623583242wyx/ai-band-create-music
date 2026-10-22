@@ -360,7 +360,7 @@ class GenerationOrchestrator:
                         task_progress = min(99, int(song_number / effective_count * 100))
                     if music_result.title and not song_title:
                         song_title = music_result.title
-                    if music_result.lyrics and not lyrics:
+                    if music_result.lyrics and not lyrics and not outputs:
                         lyrics = music_result.lyrics
                     response["title"] = song_title
                     response["lyrics"] = lyrics
@@ -370,8 +370,10 @@ class GenerationOrchestrator:
                             response["warning"] = "；".join(
                                 filter(None, [response.get("warning"), note])
                             )
-                    if music_result.title or music_result.lyrics:
-                        # job.json 与 prompts.json 都留下服务商返回的歌名/歌词。
+                    if direct_prompt and not outputs and (
+                        music_result.title or music_result.lyrics
+                    ):
+                        # 只有第一首成功候选写任务级歌名/歌词，后续候选的歌词留在各自结果里。
                         update_job_diagnostics(
                             self.settings.output_dir,
                             job_id,
