@@ -26,7 +26,8 @@ ARG APP_UID=1000
 ARG APP_GID=1000
 ARG SOURCE_REVISION=unknown
 
-RUN apt-get update \
+RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
     && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid "${APP_GID}" app \
