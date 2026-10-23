@@ -150,7 +150,7 @@ async def test_ready_accepts_music_api_key_for_elevenlabs(tmp_path: Path) -> Non
     )
     app = create_app(settings)
     async with await _client(app) as client:
-        response = await client.get("/api/health/ready")
+        response = await client.get("/health/ready")
     assert response.status_code == 200
     assert response.json()["checks"]["provider"] is True
 

@@ -1,4 +1,4 @@
-# 组件元数据供统一部署与整套发布使用；当前 3199 尚未加载音乐适配器。
+# 组件元数据供统一部署与整套发布使用；部署台音乐适配器按此声明校验，spec 须与 contract-music.json 完全一致。
 apiVersion: deployment.shuji.dev/v1alpha1
 kind: Component
 metadata:

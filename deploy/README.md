@@ -1,6 +1,6 @@
 # 音乐生成独立部署
 
-本目录的 `component.yaml` 声明音乐服务构建目标、8010 端口、输出数据卷和 live/ready 探针；`compose.yaml` 用 Compose 项目名隔离网络与命名卷。3199 当前仍只把音乐仓作为共享服务展示，不执行本声明。
+本目录的 `component.yaml` 声明音乐服务构建目标、8010 端口、输出数据卷和 live/ready 探针；`compose.yaml` 用 Compose 项目名隔离网络与命名卷。部署台（3199）的音乐适配器按此声明校验并据此构建、探活与登记数据卷，`spec` 须与 `contract-music.json` 完全一致。
 
 ## 首次部署
 
